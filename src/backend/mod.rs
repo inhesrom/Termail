@@ -36,5 +36,6 @@ pub trait EmailBackend: Send + Sync {
         flag: EmailFlag,
         value: bool,
     ) -> Result<()>;
+    async fn search_emails(&self, mailbox: &str, query: &str) -> Result<Vec<Envelope>>;
     fn provider_name(&self) -> &str;
 }

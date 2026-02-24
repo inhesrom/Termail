@@ -100,6 +100,7 @@ impl EmailBackend for ImapBackend {
             });
         }
 
+        tracing::debug!("Listed {} mailboxes", mailboxes.len());
         session.logout().await?;
         Ok(mailboxes)
     }
@@ -135,73 +136,19 @@ impl EmailBackend for ImapBackend {
         let mut envelopes = Vec::new();
         for msg in messages {
             let msg = msg?;
-            let uid = msg.uid.unwrap_or(0);
-            if uid == 0 {
-                continue;
+            if let Some(env) = parse_fetch_to_envelope(&msg) {
+                envelopes.push(env);
             }
-
-            let (is_read, is_starred) = parse_imap_flags(&msg);
-
-            let (from_name, from_address, subject, date) =
-                if let Some(envelope) = msg.envelope() {
-                    let from = envelope.from.as_ref().and_then(|addrs| addrs.first());
-                    let from_name = from
-                        .and_then(|a| a.name.as_ref())
-                        .map(|n| String::from_utf8_lossy(n).to_string())
-                        .unwrap_or_default();
-                    let from_address = addr_to_string(from);
-
-                    let subject = envelope
-                        .subject
-                        .as_ref()
-                        .map(|s| String::from_utf8_lossy(s).to_string())
-                        .unwrap_or_default();
-
-                    let date = envelope
-                        .date
-                        .as_ref()
-                        .and_then(|d| {
-                            let d = String::from_utf8_lossy(d);
-                            chrono::DateTime::parse_from_rfc2822(&d).ok()
-                        })
-                        .map(|d| d.with_timezone(&Local))
-                        .unwrap_or_else(Local::now);
-
-                    (from_name, from_address, subject, date)
-                } else {
-                    (String::new(), String::new(), String::new(), Local::now())
-                };
-
-            let snippet = msg
-                .text()
-                .map(|t| {
-                    String::from_utf8_lossy(t)
-                        .chars()
-                        .take(100)
-                        .collect::<String>()
-                        .replace('\n', " ")
-                })
-                .unwrap_or_default();
-
-            envelopes.push(Envelope {
-                uid,
-                from_name,
-                from_address,
-                subject,
-                date,
-                snippet,
-                is_read,
-                is_starred,
-                has_attachments: false,
-            });
         }
 
+        tracing::debug!("Fetched {} envelopes from {}", envelopes.len(), mailbox);
         session.logout().await?;
         envelopes.sort_by(|a, b| b.date.cmp(&a.date));
         Ok(envelopes)
     }
 
     async fn fetch_email(&self, mailbox: &str, uid: u32) -> Result<Email> {
+        tracing::debug!("Fetching full email uid={} from {}", uid, mailbox);
         let mut session = self.connect().await?;
         session.select(mailbox).await?;
 
@@ -301,6 +248,7 @@ impl EmailBackend for ImapBackend {
     }
 
     async fn send_email(&self, to: &str, _cc: &str, subject: &str, body: &str) -> Result<()> {
+        tracing::info!("Sending email to {}", to);
         let email = lettre::Message::builder()
             .from(self.email.parse()?)
             .to(to.parse()?)
@@ -350,6 +298,7 @@ impl EmailBackend for ImapBackend {
     }
 
     async fn delete_email(&self, mailbox: &str, uid: u32) -> Result<()> {
+        tracing::debug!("Deleting email uid={} from {}", uid, mailbox);
         let mut session = self.connect().await?;
         session.select(mailbox).await?;
         let _: Vec<_> = session
@@ -363,6 +312,7 @@ impl EmailBackend for ImapBackend {
     }
 
     async fn archive_email(&self, mailbox: &str, uid: u32) -> Result<()> {
+        tracing::debug!("Archiving email uid={} from {}", uid, mailbox);
         let mut session = self.connect().await?;
         session.select(mailbox).await?;
         session
@@ -379,6 +329,7 @@ impl EmailBackend for ImapBackend {
         flag: EmailFlag,
         value: bool,
     ) -> Result<()> {
+        tracing::debug!("Setting flag {:?}={} on uid={} in {}", flag, value, uid, mailbox);
         let mut session = self.connect().await?;
         session.select(mailbox).await?;
 
@@ -399,9 +350,110 @@ impl EmailBackend for ImapBackend {
         Ok(())
     }
 
+    async fn search_emails(&self, mailbox: &str, query: &str) -> Result<Vec<Envelope>> {
+        tracing::info!("IMAP SEARCH in {} for {:?}", mailbox, query);
+        let mut session = self.connect().await?;
+        session.select(mailbox).await?;
+
+        let search_query = format!(
+            "OR OR SUBJECT \"{}\" FROM \"{}\" BODY \"{}\"",
+            query, query, query
+        );
+        let uids: Vec<u32> = session.uid_search(&search_query).await?.into_iter().collect();
+
+        if uids.is_empty() {
+            session.logout().await?;
+            return Ok(vec![]);
+        }
+
+        // Cap to 100 most recent UIDs (highest UID = most recent)
+        let mut sorted_uids = uids;
+        sorted_uids.sort_unstable();
+        let capped: Vec<u32> = sorted_uids.into_iter().rev().take(100).collect();
+
+        let uid_list: String = capped.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
+        let fetch_items = "(UID FLAGS ENVELOPE BODY.PEEK[TEXT]<0.200>)";
+        let messages: Vec<_> = session.uid_fetch(&uid_list, fetch_items).await?.collect().await;
+
+        let mut envelopes = Vec::new();
+        for msg in messages {
+            let msg = msg?;
+            if let Some(env) = parse_fetch_to_envelope(&msg) {
+                envelopes.push(env);
+            }
+        }
+
+        session.logout().await?;
+        envelopes.sort_by(|a, b| b.date.cmp(&a.date));
+        tracing::debug!("IMAP SEARCH returned {} results", envelopes.len());
+        Ok(envelopes)
+    }
+
     fn provider_name(&self) -> &str {
         "Gmail"
     }
+}
+
+/// Parse a single IMAP FETCH response into an Envelope.
+fn parse_fetch_to_envelope(msg: &async_imap::types::Fetch) -> Option<Envelope> {
+    let uid = msg.uid.unwrap_or(0);
+    if uid == 0 {
+        return None;
+    }
+
+    let (is_read, is_starred) = parse_imap_flags(msg);
+
+    let (from_name, from_address, subject, date) = if let Some(envelope) = msg.envelope() {
+        let from = envelope.from.as_ref().and_then(|addrs| addrs.first());
+        let from_name = from
+            .and_then(|a| a.name.as_ref())
+            .map(|n| String::from_utf8_lossy(n).to_string())
+            .unwrap_or_default();
+        let from_address = addr_to_string(from);
+
+        let subject = envelope
+            .subject
+            .as_ref()
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .unwrap_or_default();
+
+        let date = envelope
+            .date
+            .as_ref()
+            .and_then(|d| {
+                let d = String::from_utf8_lossy(d);
+                chrono::DateTime::parse_from_rfc2822(&d).ok()
+            })
+            .map(|d| d.with_timezone(&Local))
+            .unwrap_or_else(Local::now);
+
+        (from_name, from_address, subject, date)
+    } else {
+        (String::new(), String::new(), String::new(), Local::now())
+    };
+
+    let snippet = msg
+        .text()
+        .map(|t| {
+            String::from_utf8_lossy(t)
+                .chars()
+                .take(100)
+                .collect::<String>()
+                .replace('\n', " ")
+        })
+        .unwrap_or_default();
+
+    Some(Envelope {
+        uid,
+        from_name,
+        from_address,
+        subject,
+        date,
+        snippet,
+        is_read,
+        is_starred,
+        has_attachments: false,
+    })
 }
 
 /// Parse read and starred flags from an IMAP message.

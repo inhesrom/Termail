@@ -15,7 +15,7 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Clear, area);
 
     let block = Block::default()
-        .title(" Logs ")
+        .title(format!(" Logs [{}] ", lv.filter_level.label()))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -30,13 +30,13 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         ])
         .split(inner);
 
-    if lv.lines.is_empty() {
+    let filtered = lv.filtered_lines();
+    if filtered.is_empty() && lv.lines.is_empty() {
         let loading = Paragraph::new("Loading logs...")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(loading, chunks[0]);
     } else {
-        let lines: Vec<Line> = lv
-            .lines
+        let lines: Vec<Line> = filtered
             .iter()
             .map(|line| {
                 let color = if line.contains(" ERROR ") {
@@ -63,6 +63,8 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
     let help = Paragraph::new(Line::from(vec![
         Span::styled("j/k", Style::default().fg(Color::Cyan)),
         Span::styled(" Scroll  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Tab", Style::default().fg(Color::Cyan)),
+        Span::styled(" Filter  ", Style::default().fg(Color::DarkGray)),
         Span::styled("Esc/q", Style::default().fg(Color::Cyan)),
         Span::styled(" Close", Style::default().fg(Color::DarkGray)),
     ]));

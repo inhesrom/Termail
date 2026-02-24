@@ -37,6 +37,7 @@ pub fn load_config_from(config_path: &std::path::Path) -> Result<Config> {
                 .context("Failed to create config directory")?;
         }
 
+        tracing::debug!("No config found, creating default at {}", config_path.display());
         let default_config = default_config_template();
         std::fs::write(config_path, default_config)
             .context("Failed to write default config")?;
@@ -53,6 +54,7 @@ pub fn load_config_from(config_path: &std::path::Path) -> Result<Config> {
         .context("Failed to read config file")?;
     let config: Config = toml::from_str(&content)
         .context("Failed to parse config file")?;
+    tracing::debug!("Config loaded: {} accounts", config.accounts.len());
     Ok(config)
 }
 

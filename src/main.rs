@@ -433,12 +433,37 @@ fn execute_command(
             }
         }
         Command::Search(query) => {
-            let tx = msg_tx.clone();
-            tokio::spawn(async move {
-                // Search index (Tantivy) not wired yet — return empty results.
-                tracing::info!("Search query: {}", query);
-                let _ = tx.send(Message::SearchResults(vec![]));
-            });
+            if let Some(backend) = backend {
+                let backend = Arc::clone(backend);
+                let tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    tracing::info!("Search query: {}", query);
+                    match backend.search_emails("INBOX", &query).await {
+                        Ok(envelopes) => {
+                            let _ = tx.send(Message::SearchResults(envelopes));
+                        }
+                        Err(e) => {
+                            tracing::error!("Search failed: {}", e);
+                            let _ = tx.send(Message::SyncError(format!("Search error: {}", e)));
+                        }
+                    }
+                });
+            } else {
+                // Demo mode: local string filtering on current envelopes
+                let q = query.to_lowercase();
+                let filtered: Vec<_> = app
+                    .envelopes
+                    .iter()
+                    .filter(|e| {
+                        e.subject.to_lowercase().contains(&q)
+                            || e.from_name.to_lowercase().contains(&q)
+                            || e.from_address.to_lowercase().contains(&q)
+                            || e.snippet.to_lowercase().contains(&q)
+                    })
+                    .cloned()
+                    .collect();
+                let _ = msg_tx.send(Message::SearchResults(filtered));
+            }
         }
         Command::ResetAccount { email } => {
             if let Err(e) = auth::token_store::delete_token(&email) {

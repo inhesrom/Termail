@@ -7,6 +7,7 @@ use crate::models::envelope::Envelope;
 
 /// Initialize the SQLite database schema.
 pub fn init_db(conn: &Connection) -> Result<()> {
+    tracing::debug!("Initializing SQLite cache schema");
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS envelopes (
@@ -55,6 +56,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 
 /// Insert or replace an envelope in the cache.
 pub fn upsert_envelope(conn: &Connection, account: &str, mailbox: &str, env: &Envelope) -> Result<()> {
+    tracing::debug!("Caching envelope uid={}", env.uid);
     conn.execute(
         "INSERT OR REPLACE INTO envelopes
             (uid, account, mailbox, from_name, from_address, subject, date, snippet, is_read, is_starred, has_attachments)
@@ -107,11 +109,13 @@ pub fn load_envelopes(conn: &Connection, account: &str, mailbox: &str) -> Result
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
+    tracing::debug!("Loaded {} cached envelopes for {}/{}", envelopes.len(), account, mailbox);
     Ok(envelopes)
 }
 
 /// Cache a full email body.
 pub fn cache_email_body(conn: &Connection, account: &str, email: &Email) -> Result<()> {
+    tracing::debug!("Caching email body uid={}", email.uid);
     conn.execute(
         "INSERT OR REPLACE INTO email_bodies
             (uid, account, message_id, to_addrs, cc_addrs, body_text, body_html, fetched_at)
@@ -173,6 +177,11 @@ pub fn load_email_body(conn: &Connection, account: &str, uid: u32) -> Result<Opt
         })
         .optional()?;
 
+    if email.is_some() {
+        tracing::debug!("Cache hit for email body uid={}", uid);
+    } else {
+        tracing::debug!("Cache miss for email body uid={}", uid);
+    }
     Ok(email)
 }
 
@@ -209,6 +218,7 @@ pub fn get_sync_state(conn: &Connection, account: &str, mailbox: &str) -> Result
 
 /// Delete an envelope from the cache.
 pub fn delete_envelope(conn: &Connection, uid: u32) -> Result<()> {
+    tracing::debug!("Deleting cached envelope uid={}", uid);
     conn.execute("DELETE FROM envelopes WHERE uid = ?1", params![uid])?;
     conn.execute("DELETE FROM email_bodies WHERE uid = ?1", params![uid])?;
     Ok(())
@@ -216,6 +226,7 @@ pub fn delete_envelope(conn: &Connection, uid: u32) -> Result<()> {
 
 /// Update a flag on a cached envelope.
 pub fn update_envelope_flag(conn: &Connection, uid: u32, flag: &str, value: bool) -> Result<()> {
+    tracing::debug!("Updating cached flag {}={} for uid={}", flag, value, uid);
     let column = match flag {
         "seen" => "is_read",
         "starred" => "is_starred",

@@ -178,6 +178,7 @@ fn convert_log_viewer_key(key: event::KeyEvent) -> Option<Message> {
         (KeyModifiers::NONE, KeyCode::Char('k') | KeyCode::Up) => {
             Some(Message::LogViewerScrollUp)
         }
+        (KeyModifiers::NONE, KeyCode::Tab) => Some(Message::LogViewerCycleLevel),
         _ => None,
     }
 }

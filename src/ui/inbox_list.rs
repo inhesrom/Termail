@@ -15,8 +15,14 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let title = if app.pre_search_envelopes.is_some() {
+        format!(" Search Results ({}) ", app.envelopes.len())
+    } else {
+        " Inbox ".to_string()
+    };
+
     let block = Block::default()
-        .title(" Inbox ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 

@@ -20,6 +20,7 @@ impl GoogleAuth {
         client_id: &str,
         client_secret: &str,
     ) -> Result<Self> {
+        tracing::debug!("Building Google OAuth authenticator");
         let secret = yup_oauth2::ApplicationSecret {
             client_id: client_id.to_string(),
             client_secret: client_secret.to_string(),
@@ -45,6 +46,7 @@ impl GoogleAuth {
 
     /// Get a fresh access token for IMAP/SMTP XOAUTH2.
     pub async fn get_access_token(&self) -> Result<String> {
+        tracing::debug!("Requesting Google access token");
         let token = self
             .authenticator
             .token(GMAIL_SCOPES)

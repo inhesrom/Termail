@@ -12,6 +12,7 @@ pub fn sync_envelopes(
     mailbox: &str,
     new_envelopes: &[Envelope],
 ) -> Result<()> {
+    tracing::debug!("Syncing {} envelopes to cache for {}/{}", new_envelopes.len(), account, mailbox);
     let tx = conn.unchecked_transaction()?;
 
     for env in new_envelopes {
@@ -24,6 +25,7 @@ pub fn sync_envelopes(
     }
 
     tx.commit()?;
+    tracing::debug!("Cache sync complete");
     Ok(())
 }
 

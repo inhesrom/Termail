@@ -23,6 +23,7 @@ impl SearchIndex {
     /// Open or create the search index at the given path.
     pub fn open(data_dir: &Path) -> Result<Self> {
         let index_path = data_dir.join("search_index");
+        tracing::debug!("Opening search index at {}", index_path.display());
         std::fs::create_dir_all(&index_path)?;
 
         let mut schema_builder = Schema::builder();
@@ -92,6 +93,7 @@ impl SearchIndex {
 
     /// Batch index multiple envelopes.
     pub fn index_envelopes(&self, envelopes: &[Envelope]) -> Result<()> {
+        tracing::debug!("Indexing {} envelopes", envelopes.len());
         let mut writer = self
             .index
             .writer(15_000_000)
@@ -113,7 +115,7 @@ impl SearchIndex {
     }
 
     /// Search for envelopes matching a query string. Returns matching UIDs.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<u32>> {
+    pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<u32>> {
         let reader = self
             .index
             .reader_builder()
@@ -131,7 +133,7 @@ impl SearchIndex {
         let query_parser = QueryParser::for_index(&self.index, search_fields);
 
         let query = query_parser
-            .parse_query(query)
+            .parse_query(query_str)
             .context("Failed to parse search query")?;
 
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
@@ -146,6 +148,7 @@ impl SearchIndex {
             }
         }
 
+        tracing::debug!("Search query={:?} returned {} results", query_str, uids.len());
         Ok(uids)
     }
 }

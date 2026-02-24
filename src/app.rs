@@ -58,11 +58,63 @@ pub struct SetupState {
     pub status: Option<String>,
 }
 
+/// Log level filter for the log viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFilter {
+    All,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogFilter {
+    /// Cycle to the next filter level.
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Debug,
+            Self::Debug => Self::Info,
+            Self::Info => Self::Warn,
+            Self::Warn => Self::Error,
+            Self::Error => Self::All,
+        }
+    }
+
+    /// Check if a log line passes the filter.
+    pub fn matches(self, line: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Debug => true,
+            Self::Info => !line.contains(" DEBUG "),
+            Self::Warn => line.contains(" WARN ") || line.contains(" ERROR "),
+            Self::Error => line.contains(" ERROR "),
+        }
+    }
+
+    /// Display label for the title bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Debug => "DEBUG+",
+            Self::Info => "INFO+",
+            Self::Warn => "WARN+",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
 /// Log viewer overlay state.
 #[derive(Debug, Clone)]
 pub struct LogViewerState {
     pub lines: Vec<String>,
     pub scroll: u16,
+    pub filter_level: LogFilter,
+}
+
+impl LogViewerState {
+    pub fn filtered_lines(&self) -> Vec<&String> {
+        self.lines.iter().filter(|l| self.filter_level.matches(l)).collect()
+    }
 }
 
 /// Commands returned by update() for side effects.
@@ -103,6 +155,7 @@ pub struct App {
     pub compose: Option<ComposeState>,
     pub setup: Option<SetupState>,
     pub log_viewer: Option<LogViewerState>,
+    pub pre_search_envelopes: Option<Vec<Envelope>>,
     pub sync_status: SyncStatus,
     pub account_email: String,
     pub has_accounts: bool,
@@ -152,6 +205,7 @@ impl App {
             compose: None,
             setup,
             log_viewer: None,
+            pre_search_envelopes: None,
             sync_status,
             account_email,
             has_accounts,
@@ -202,6 +256,11 @@ impl App {
                 self.search_active = !self.search_active;
                 if !self.search_active {
                     self.search_query.clear();
+                    if let Some(original) = self.pre_search_envelopes.take() {
+                        self.envelopes = original;
+                        self.selected_index = 0;
+                        self.selected_email = None;
+                    }
                 }
             }
             Message::SearchInput(ch) => {
@@ -222,6 +281,11 @@ impl App {
             Message::SearchClear => {
                 self.search_active = false;
                 self.search_query.clear();
+                if let Some(original) = self.pre_search_envelopes.take() {
+                    self.envelopes = original;
+                    self.selected_index = 0;
+                    self.selected_email = None;
+                }
             }
 
             // -- Compose --
@@ -445,6 +509,7 @@ impl App {
                 self.log_viewer = Some(LogViewerState {
                     lines: vec![],
                     scroll: 0,
+                    filter_level: LogFilter::All,
                 });
                 return vec![Command::LoadLogs];
             }
@@ -454,13 +519,20 @@ impl App {
                     lv.scroll = 0;
                 }
             }
+            Message::LogViewerCycleLevel => {
+                if let Some(lv) = &mut self.log_viewer {
+                    lv.filter_level = lv.filter_level.next();
+                    lv.scroll = 0;
+                }
+            }
             Message::LogViewerScrollDown => {
-                if let Some(lv) = &mut self.log_viewer
-                    && !lv.lines.is_empty()
-                {
-                    lv.scroll = lv.scroll.saturating_add(1).min(
-                        (lv.lines.len() as u16).saturating_sub(1),
-                    );
+                if let Some(lv) = &mut self.log_viewer {
+                    let count = lv.filtered_lines().len();
+                    if count > 0 {
+                        lv.scroll = lv.scroll.saturating_add(1).min(
+                            (count as u16).saturating_sub(1),
+                        );
+                    }
                 }
             }
             Message::LogViewerScrollUp => {
@@ -507,6 +579,7 @@ impl App {
             // -- Async results --
             Message::EnvelopesFetched(envelopes) => {
                 self.envelopes = envelopes;
+                self.pre_search_envelopes = None;
                 self.sync_status = SyncStatus::LastSync(Local::now());
                 if self.selected_index >= self.envelopes.len() {
                     self.selected_index = 0;
@@ -516,15 +589,21 @@ impl App {
                 self.selected_email = Some(*email);
                 self.preview_scroll = 0;
             }
-            Message::SearchResults(uids) => {
-                // Filter envelopes to only those matching search results
-                if uids.is_empty() {
-                    // No results — keep current list but could show a message
+            Message::SearchResults(results) => {
+                if results.is_empty() {
+                    // No results — clear search mode, inbox unchanged
+                    self.search_active = false;
+                    self.search_query.clear();
                 } else {
-                    let uid_set: std::collections::HashSet<u32> = uids.into_iter().collect();
-                    self.envelopes.retain(|e| uid_set.contains(&e.uid));
+                    // Save originals so we can restore on search clear
+                    if self.pre_search_envelopes.is_none() {
+                        self.pre_search_envelopes = Some(self.envelopes.clone());
+                    }
+                    self.envelopes = results;
                     self.selected_index = 0;
                     self.selected_email = None;
+                    self.search_active = false;
+                    self.search_query.clear();
                 }
             }
             Message::SyncComplete => {

@@ -62,6 +62,7 @@ fn detect_provider(_email: &str) -> Provider {
 
 /// Remove all accounts from the config file, resetting it to the default template.
 pub fn remove_account_from_config() -> Result<()> {
+    tracing::debug!("Removing all accounts from config");
     let config_path = config::config_dir()?.join("config.toml");
     remove_account_from_config_at(&config_path)
 }
@@ -75,6 +76,7 @@ pub fn remove_account_from_config_at(config_path: &std::path::Path) -> Result<()
 
 /// Append an [[accounts]] entry to the config file.
 pub fn append_account_to_config(account: &Account) -> Result<()> {
+    tracing::debug!("Appending account {} to config", account.email);
     let config_dir = config::config_dir()?;
     append_account_to_config_at(account, &config_dir)
 }

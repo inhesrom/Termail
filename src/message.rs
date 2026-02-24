@@ -46,6 +46,7 @@ pub enum Message {
     LogViewerLoaded(Vec<String>),
     LogViewerScrollDown,
     LogViewerScrollUp,
+    LogViewerCycleLevel,
     CloseLogViewer,
 
     // Email actions
@@ -58,7 +59,7 @@ pub enum Message {
     // Async results
     EnvelopesFetched(Vec<crate::models::envelope::Envelope>),
     EmailFetched(Box<crate::models::email::Email>),
-    SearchResults(Vec<u32>),
+    SearchResults(Vec<crate::models::envelope::Envelope>),
     SyncComplete,
     SyncError(String),
 
