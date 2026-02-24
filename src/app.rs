@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::Local;
 
 use crate::message::Message;
@@ -160,6 +162,7 @@ pub struct App {
     pub account_email: String,
     pub has_accounts: bool,
     pub running: bool,
+    pub image_picker: Option<ratatui_image::picker::Picker>,
 }
 
 impl App {
@@ -210,6 +213,7 @@ impl App {
             account_email,
             has_accounts,
             running: true,
+            image_picker: ratatui_image::picker::Picker::from_query_stdio().ok(),
         }
     }
 
@@ -835,6 +839,7 @@ Best regards,
 John"#.into(),
         body_html: None,
         attachments: vec![],
+        inline_images: HashMap::new(),
         is_read: false,
         is_starred: true,
     }

@@ -171,6 +171,7 @@ pub fn load_email_body(conn: &Connection, account: &str, uid: u32) -> Result<Opt
                 body_text: row.get(10)?,
                 body_html: row.get(11)?,
                 attachments: vec![], // Attachments stored separately if needed
+                inline_images: std::collections::HashMap::new(),
                 is_read: row.get::<_, i32>(5)? != 0,
                 is_starred: row.get::<_, i32>(6)? != 0,
             })
@@ -400,6 +401,7 @@ mod tests {
             body_text: "Hello, this is a test email body.".into(),
             body_html: Some("<p>Hello</p>".into()),
             attachments: vec![],
+            inline_images: std::collections::HashMap::new(),
             is_read: false,
             is_starred: false,
         };

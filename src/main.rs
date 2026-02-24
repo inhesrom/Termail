@@ -306,6 +306,7 @@ fn execute_command(
                         body_text: env.snippet.clone(),
                         body_html: None,
                         attachments: vec![],
+                        inline_images: std::collections::HashMap::new(),
                         is_read: env.is_read,
                         is_starred: env.is_starred,
                     };

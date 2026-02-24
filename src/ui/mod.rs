@@ -1,6 +1,7 @@
 pub mod animations;
 pub mod compose;
 pub mod email_preview;
+pub mod html_renderer;
 pub mod inbox_list;
 pub mod log_viewer;
 pub mod search_bar;

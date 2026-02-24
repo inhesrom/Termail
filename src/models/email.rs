@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Local};
 
 /// A full email with headers and parsed body content.
@@ -14,6 +16,7 @@ pub struct Email {
     pub body_text: String,
     pub body_html: Option<String>,
     pub attachments: Vec<Attachment>,
+    pub inline_images: HashMap<String, Vec<u8>>,
     pub is_read: bool,
     pub is_starred: bool,
 }

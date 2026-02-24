@@ -32,8 +32,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Full-text search
 tantivy = "0.22"
 
-# HTML to text
-html2text = "0.14"
+# HTML to text (with CSS colour support for rich rendering)
+html2text = { version = "0.14", features = [] }
+
+# Terminal image rendering (Kitty/iTerm2/Sixel + unicode fallback)
+ratatui-image = "4"
+image = "0.25"
 
 # Credential storage
 keyring = { version = "3", features = ["apple-native", "linux-native"] }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -168,6 +169,7 @@ impl EmailBackend for ImapBackend {
         let body_text = extract_text_body(&parsed);
         let body_html = extract_html_body(&parsed);
         let attachments = extract_attachments(&parsed);
+        let inline_images = extract_inline_images(&parsed);
 
         let (is_read, is_starred) = parse_imap_flags(&msg);
 
@@ -219,7 +221,7 @@ impl EmailBackend for ImapBackend {
             };
 
         // Convert HTML body to text if no text body available
-        let display_text = if body_text.is_empty() {
+        let fallback_text = if body_text.is_empty() {
             body_html
                 .as_ref()
                 .and_then(|html| html2text::from_read(html.as_bytes(), 80).ok())
@@ -239,9 +241,10 @@ impl EmailBackend for ImapBackend {
             cc,
             subject,
             date,
-            body_text: display_text,
+            body_text: fallback_text,
             body_html,
             attachments,
+            inline_images,
             is_read,
             is_starred,
         })
@@ -541,6 +544,35 @@ fn extract_attachments(parsed: &mailparse::ParsedMail) -> Vec<Attachment> {
     }
 
     attachments
+}
+
+fn extract_inline_images(parsed: &mailparse::ParsedMail) -> HashMap<String, Vec<u8>> {
+    let mut images = HashMap::new();
+    collect_inline_images(parsed, &mut images);
+    images
+}
+
+fn collect_inline_images(parsed: &mailparse::ParsedMail, images: &mut HashMap<String, Vec<u8>>) {
+    if parsed.ctype.mimetype.starts_with("image/")
+        && let Some(cid) = parsed
+            .headers
+            .iter()
+            .find(|h| h.get_key().eq_ignore_ascii_case("Content-ID"))
+            .map(|h| {
+                let val = h.get_value();
+                val.trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string()
+            })
+        && let Ok(body) = parsed.get_body_raw()
+        && body.len() <= 5 * 1024 * 1024
+    {
+        images.insert(cid, body);
+    }
+    for part in &parsed.subparts {
+        collect_inline_images(part, images);
+    }
 }
 
 #[cfg(test)]
