@@ -10,6 +10,11 @@ pub enum Message {
     ScrollPreviewDown,
     ScrollPreviewUp,
 
+    // Mouse
+    MouseClick(u16, u16),
+    MouseScrollDown(u16, u16),
+    MouseScrollUp(u16, u16),
+
     // Search
     ToggleSearch,
     SearchInput(char),

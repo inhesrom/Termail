@@ -142,6 +142,7 @@ async fn run(
 
     // Queue initial fade-in effect
     let term_size = terminal.size()?;
+    app.terminal_size = (term_size.width, term_size.height);
     let size = ratatui::layout::Rect::new(0, 0, term_size.width, term_size.height);
     animations.add_effect(
         ui::animations::AnimationManager::fade_in_effect(),

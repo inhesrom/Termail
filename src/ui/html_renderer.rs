@@ -199,10 +199,15 @@ fn render_element(
         "script" | "style" | "noscript" | "template" => {}
 
         // --- Block elements ---
-        "p" | "div" => {
+        "p" => {
             push_block_spacing(segments);
             walk_children(node_id, doc, &ctx, segments);
             push_block_spacing(segments);
+        }
+
+        // <div> is a structural wrapper, not a visual paragraph — no extra spacing
+        "div" => {
+            walk_children(node_id, doc, &ctx, segments);
         }
 
         "h1" => render_heading(
@@ -393,10 +398,20 @@ fn walk_with_modifier(
 }
 
 /// Append a blank-line segment, suppressing duplicates.
+///
+/// If the last segment is a `LineBreak`, replace it with `BlankLine`
+/// instead of adding another one (prevents `<br>` + block boundary
+/// double spacing).
 fn push_block_spacing(segments: &mut Vec<Segment>) {
-    // Avoid duplicate blank lines
-    if let Some(Segment::BlankLine) = segments.last() {
-        return;
+    match segments.last() {
+        Some(Segment::BlankLine) => return,
+        Some(Segment::LineBreak) => {
+            // Replace the LineBreak with a BlankLine to avoid double spacing
+            let len = segments.len();
+            segments[len - 1] = Segment::BlankLine;
+            return;
+        }
+        _ => {}
     }
     segments.push(Segment::BlankLine);
 }
@@ -591,6 +606,12 @@ fn parse_color_value(value: &str) -> Option<Color> {
 // Phase 3: Layout — segments to lines
 // ---------------------------------------------------------------------------
 
+/// Returns true if a `Line` has no spans or all spans are whitespace-only.
+fn is_visually_blank(line: &Line<'_>) -> bool {
+    line.spans.is_empty()
+        || line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
 /// Convert a flat segment list into wrapped, styled ratatui Lines.
 fn segments_to_lines(segments: &[Segment], width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -635,7 +656,7 @@ fn segments_to_lines(segments: &[Segment], width: usize) -> Vec<Line<'static>> {
                     current_width = 0;
                 }
                 // Only add blank line if last line wasn't already blank
-                if !lines.last().is_some_and(|l| l.spans.is_empty()) {
+                if !lines.last().is_some_and(|l| is_visually_blank(l)) {
                     lines.push(Line::from(""));
                 }
             }
@@ -672,11 +693,24 @@ fn segments_to_lines(segments: &[Segment], width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(current_spans));
     }
 
+    // Collapse consecutive visually-blank lines to at most 1
+    let mut deduped: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if is_visually_blank(&line) {
+            if !deduped.last().is_some_and(|l| is_visually_blank(l)) {
+                deduped.push(line);
+            }
+        } else {
+            deduped.push(line);
+        }
+    }
+    let mut lines = deduped;
+
     // Trim leading/trailing blank lines
-    while lines.first().is_some_and(|l| l.spans.is_empty()) {
+    while lines.first().is_some_and(|l| is_visually_blank(l)) {
         lines.remove(0);
     }
-    while lines.last().is_some_and(|l| l.spans.is_empty()) {
+    while lines.last().is_some_and(|l| is_visually_blank(l)) {
         lines.pop();
     }
 
@@ -1163,5 +1197,76 @@ mod tests {
         assert_eq!(blocks.len(), 2, "Consecutive images should be separate blocks");
         assert!(matches!(&blocks[0], ContentBlock::Image { .. }));
         assert!(matches!(&blocks[1], ContentBlock::Image { .. }));
+    }
+
+    // === Whitespace / blank-line dedup tests ===
+
+    fn count_blank_lines(lines: &[Line<'_>]) -> Vec<usize> {
+        let mut runs = Vec::new();
+        let mut count = 0;
+        for line in lines {
+            if is_visually_blank(line) {
+                count += 1;
+            } else {
+                if count > 0 {
+                    runs.push(count);
+                }
+                count = 0;
+            }
+        }
+        if count > 0 {
+            runs.push(count);
+        }
+        runs
+    }
+
+    #[test]
+    fn test_no_consecutive_blanks_p_br_p() {
+        let lines = render_html("<p>Hello</p><br><p>World</p>", 80);
+        let runs = count_blank_lines(&lines);
+        for (i, &run) in runs.iter().enumerate() {
+            assert!(run <= 1, "Blank-line run #{} has {} consecutive blanks", i, run);
+        }
+    }
+
+    #[test]
+    fn test_no_consecutive_blanks_nested_divs() {
+        let lines = render_html(
+            "<div><div><p>Inner</p></div></div><p>Outer</p>",
+            80,
+        );
+        let runs = count_blank_lines(&lines);
+        for (i, &run) in runs.iter().enumerate() {
+            assert!(run <= 1, "Blank-line run #{} has {} consecutive blanks", i, run);
+        }
+    }
+
+    #[test]
+    fn test_no_consecutive_blanks_spacer_p() {
+        let lines = render_html("<p><br></p><p>Content</p>", 80);
+        let runs = count_blank_lines(&lines);
+        for (i, &run) in runs.iter().enumerate() {
+            assert!(run <= 1, "Blank-line run #{} has {} consecutive blanks", i, run);
+        }
+    }
+
+    #[test]
+    fn test_div_no_extra_spacing() {
+        let lines = render_html("<div>Hello</div><div>World</div>", 80);
+        let text = collect_text(&lines);
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        let runs = count_blank_lines(&lines);
+        assert!(runs.is_empty(), "Adjacent divs should not produce blank lines, got runs: {:?}", runs);
+    }
+
+    #[test]
+    fn test_is_visually_blank_helper() {
+        assert!(is_visually_blank(&Line::from("")));
+        assert!(is_visually_blank(&Line::from("  ")));
+        assert!(is_visually_blank(&Line::from(vec![Span::raw(""), Span::raw("  ")])));
+        assert!(!is_visually_blank(&Line::from("hello")));
+        // Line with 0 spans
+        assert!(is_visually_blank(&Line { spans: vec![], ..Default::default() }));
     }
 }

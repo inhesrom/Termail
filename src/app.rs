@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use chrono::Local;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::message::Message;
 use crate::models::email::Email;
@@ -163,6 +164,7 @@ pub struct App {
     pub account_email: String,
     pub has_accounts: bool,
     pub running: bool,
+    pub terminal_size: (u16, u16),
     pub image_picker: ratatui_image::picker::Picker,
     /// Cached `StatefulProtocol` instances for inline images, keyed by CID.
     /// Uses `RefCell` for interior mutability so the render chain can work
@@ -218,6 +220,7 @@ impl App {
             account_email,
             has_accounts,
             running: true,
+            terminal_size: (80, 24),
             image_picker,
             image_protocol_cache: RefCell::new(HashMap::new()),
         }
@@ -268,6 +271,67 @@ impl App {
             }
             Message::ScrollPreviewUp => {
                 self.preview_scroll = self.preview_scroll.saturating_sub(1);
+            }
+
+            // -- Mouse --
+            Message::MouseClick(col, row) => {
+                // Skip mouse handling when overlays are open
+                if self.no_overlay_active() {
+                    let (inbox_area, preview_area) = self.compute_pane_areas();
+                    let pos = ratatui::layout::Position { x: col, y: row };
+
+                    if inbox_area.contains(pos) {
+                        self.active_pane = Pane::InboxList;
+                        // Each list item is 2 lines tall; account for border (1 row at top)
+                        let inner_y = row.saturating_sub(inbox_area.y + 1);
+                        let inner_height = inbox_area.height.saturating_sub(2); // borders
+
+                        // Estimate which items are visible based on selected_index
+                        let visible_items = (inner_height / 2) as usize;
+                        let scroll_offset = if self.selected_index >= visible_items {
+                            self.selected_index - visible_items + 1
+                        } else {
+                            0
+                        };
+
+                        let clicked_item = scroll_offset + (inner_y / 2) as usize;
+                        if clicked_item < self.envelopes.len() {
+                            self.selected_index = clicked_item;
+                            return self.update(Message::OpenSelected);
+                        }
+                    } else if preview_area.contains(pos) {
+                        self.active_pane = Pane::EmailPreview;
+                    }
+                }
+            }
+            Message::MouseScrollDown(col, row) => {
+                if self.no_overlay_active() {
+                    let (inbox_area, preview_area) = self.compute_pane_areas();
+                    let pos = ratatui::layout::Position { x: col, y: row };
+
+                    if inbox_area.contains(pos) {
+                        if !self.envelopes.is_empty() {
+                            self.selected_index =
+                                (self.selected_index + 1).min(self.envelopes.len() - 1);
+                            self.preview_scroll = 0;
+                        }
+                    } else if preview_area.contains(pos) {
+                        self.preview_scroll = self.preview_scroll.saturating_add(3);
+                    }
+                }
+            }
+            Message::MouseScrollUp(col, row) => {
+                if self.no_overlay_active() {
+                    let (inbox_area, preview_area) = self.compute_pane_areas();
+                    let pos = ratatui::layout::Position { x: col, y: row };
+
+                    if inbox_area.contains(pos) {
+                        self.selected_index = self.selected_index.saturating_sub(1);
+                        self.preview_scroll = 0;
+                    } else if preview_area.contains(pos) {
+                        self.preview_scroll = self.preview_scroll.saturating_sub(3);
+                    }
+                }
             }
 
             // -- Search --
@@ -637,8 +701,8 @@ impl App {
             Message::Tick => {
                 // Animation ticks handled in render loop
             }
-            Message::Resize(_, _) => {
-                // Ratatui handles resize automatically
+            Message::Resize(w, h) => {
+                self.terminal_size = (w, h);
             }
             Message::Quit => {
                 self.running = false;
@@ -652,6 +716,37 @@ impl App {
     /// Count of unread emails in the current inbox.
     pub fn unread_count(&self) -> usize {
         self.envelopes.iter().filter(|e| !e.is_read).count()
+    }
+
+    /// Returns true when no blocking overlay (setup, compose, log viewer) is active.
+    fn no_overlay_active(&self) -> bool {
+        self.setup.is_none() && self.compose.is_none() && self.log_viewer.is_none()
+    }
+
+    /// Compute the inbox and preview pane areas based on current terminal size.
+    /// Mirrors the layout logic in `ui/mod.rs`.
+    fn compute_pane_areas(&self) -> (Rect, Rect) {
+        let (w, h) = self.terminal_size;
+        let size = Rect::new(0, 0, w, h);
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),  // Header + search bar
+                Constraint::Min(5),    // Main content
+                Constraint::Length(1), // Status bar
+            ])
+            .split(size);
+
+        let main_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(30),
+                Constraint::Percentage(70),
+            ])
+            .split(outer[1]);
+
+        (main_area[0], main_area[1])
     }
 
     /// Remove the selected envelope from the list, clamp the index, and clear

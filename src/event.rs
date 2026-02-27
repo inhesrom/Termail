@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use tokio::sync::mpsc;
 
 use crate::message::Message;
@@ -185,8 +185,15 @@ fn convert_log_viewer_key(key: event::KeyEvent) -> Option<Message> {
 
 fn convert_mouse(mouse: event::MouseEvent, _mode: InputMode) -> Option<Message> {
     match mouse.kind {
-        MouseEventKind::ScrollDown => Some(Message::SelectNext),
-        MouseEventKind::ScrollUp => Some(Message::SelectPrevious),
+        MouseEventKind::Down(MouseButton::Left) => {
+            Some(Message::MouseClick(mouse.column, mouse.row))
+        }
+        MouseEventKind::ScrollDown => {
+            Some(Message::MouseScrollDown(mouse.column, mouse.row))
+        }
+        MouseEventKind::ScrollUp => {
+            Some(Message::MouseScrollUp(mouse.column, mouse.row))
+        }
         _ => None,
     }
 }
