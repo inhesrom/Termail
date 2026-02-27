@@ -11,6 +11,7 @@ mod models;
 mod setup;
 mod ui;
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,25 +54,59 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    // Initialize logging to file
+    // Initialize logging to file (fresh log each session)
     let data_dir = config::data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
-    let log_file = tracing_appender::rolling::daily(&data_dir, "termail.log");
+    let log_file = std::fs::File::create(data_dir.join("termail.log"))?;
     let (non_blocking, _guard) = tracing_appender::non_blocking(log_file);
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_env_filter("termail=debug")
         .init();
 
-    // Terminal setup
+    // Terminal setup — enter alternate screen first, but delay mouse capture
+    // until after the image protocol probe. EnableMouseCapture causes the
+    // terminal to send mouse events via stdin, which corrupts the
+    // stdin-based capability query in from_query_stdio().
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Probe terminal image protocol BEFORE mouse capture so stdin is clean.
+    //
+    // Ghostty requires per-cell diacritics on Kitty unicode placeholders.
+    // Our vendored ratatui-image includes this fix, so override to Kitty.
+    let image_picker = match ratatui_image::picker::Picker::from_query_stdio() {
+        Ok(mut picker) => {
+            tracing::info!(
+                "Image picker: {:?} protocol, font_size={:?}",
+                picker.protocol_type(),
+                picker.font_size()
+            );
+            if is_ghostty() {
+                tracing::info!("Ghostty detected — overriding to Kitty protocol");
+                picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+            }
+            picker
+        }
+        Err(e) => {
+            tracing::warn!("Image protocol query failed ({}), using fallback", e);
+            let mut picker = ratatui_image::picker::Picker::halfblocks();
+            if is_ghostty() {
+                tracing::info!("Ghostty detected (fallback) — using Kitty protocol");
+                picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+            }
+            picker
+        }
+    };
+
+    // NOW enable mouse capture — stdin is no longer needed for protocol detection.
+    execute!(terminal.backend_mut(), EnableMouseCapture)?;
+
     // Run the app
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, image_picker).await;
 
     // Terminal teardown (always runs, even on error)
     disable_raw_mode()?;
@@ -85,9 +120,12 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    image_picker: ratatui_image::picker::Picker,
+) -> anyhow::Result<()> {
     tracing::info!("Termail starting");
-    let mut app = App::new();
+    let mut app = App::new(image_picker);
     let mut events = EventHandler::new(Duration::from_millis(16));
     let mut animations = ui::animations::AnimationManager::new();
 
@@ -113,6 +151,14 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::R
     if imap_backend.is_some() {
         tracing::info!("Starting initial inbox sync...");
         execute_command(Command::FetchEnvelopes, &app, imap_backend.as_ref(), &msg_tx);
+    } else if app.has_accounts {
+        // Account exists but backend creation failed (likely missing credentials
+        // after migrating from keyring to file-based store). Show error and
+        // prompt re-setup.
+        tracing::warn!("Account configured but credentials missing — prompting re-setup");
+        app.sync_status = app::SyncStatus::Error(
+            "Credentials not found. Press X to reset account and re-enter your password.".into(),
+        );
     }
 
     while app.running {
@@ -130,11 +176,24 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::R
         };
         events.set_mode(mode);
 
-        // View: render current state, then apply animation effects on top
+        // View: render current state, then apply animation effects on top.
+        // Track whether animations are active BEFORE drawing: animation
+        // effects overwrite buffer cells including Kitty protocol image
+        // data (escape sequences + U+10EEEE placeholders). The Kitty
+        // protocol uses a one-shot transmission that is consumed on the
+        // first render, so if the animation overwrites it before ratatui
+        // flushes the buffer, the image data never reaches the terminal.
+        let had_animations = animations.has_active_effects();
         terminal.draw(|f| {
             ui::view(f, &app);
             animations.tick(f.buffer_mut());
         })?;
+        // Invalidate the image protocol cache so that the next
+        // animation-free frame creates fresh protocols that will
+        // re-transmit their image data to the terminal.
+        if had_animations {
+            app.image_protocol_cache.borrow_mut().clear();
+        }
 
         // Wait for next event/message (from events or async results)
         let msg = tokio::select! {
@@ -178,18 +237,19 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::R
             }
 
             // Trigger email transition when switching emails
-            if commands.iter().any(|c| matches!(c, Command::FetchEmail(_))) {
-                let preview_area = ratatui::layout::Rect {
-                    x: size.width * 30 / 100,
-                    y: 3,
-                    width: size.width * 70 / 100,
-                    height: size.height.saturating_sub(4),
-                };
-                animations.add_effect(
-                    ui::animations::AnimationManager::email_transition_effect(),
-                    preview_area,
-                );
-            }
+            // TEMPORARILY DISABLED to debug image rendering
+            // if commands.iter().any(|c| matches!(c, Command::FetchEmail(_))) {
+            //     let preview_area = ratatui::layout::Rect {
+            //         x: size.width * 30 / 100,
+            //         y: 3,
+            //         width: size.width * 70 / 100,
+            //         height: size.height.saturating_sub(4),
+            //     };
+            //     animations.add_effect(
+            //         ui::animations::AnimationManager::email_transition_effect(),
+            //         preview_area,
+            //     );
+            // }
 
             for cmd in commands {
                 execute_command(cmd, &app, imap_backend.as_ref(), &msg_tx);
@@ -221,7 +281,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::R
     Ok(())
 }
 
-/// Create an IMAP backend from the first account in config + keyring password.
+/// Returns true if the terminal is Ghostty (which needs Kitty protocol, not Sixel).
+fn is_ghostty() -> bool {
+    std::env::var("TERM_PROGRAM").is_ok_and(|v| v.eq_ignore_ascii_case("ghostty"))
+}
+
+/// Create an IMAP backend from the first account in config + stored credentials.
 fn create_backend() -> Option<Arc<ImapBackend>> {
     tracing::info!("Loading account configuration...");
     let config = match config::load_config() {
@@ -239,15 +304,15 @@ fn create_backend() -> Option<Arc<ImapBackend>> {
         }
     };
     tracing::info!("Found account: {}", account.email);
-    tracing::info!("Retrieving credentials from keyring...");
+    tracing::info!("Retrieving stored credentials...");
     let password = match auth::token_store::get_token(&account.email) {
         Ok(Some(pw)) => pw,
         Ok(None) => {
-            tracing::warn!("No credentials found in keyring for {}", account.email);
+            tracing::warn!("No stored credentials found for {}", account.email);
             return None;
         }
         Err(e) => {
-            tracing::warn!("Failed to retrieve credentials from keyring: {}", e);
+            tracing::warn!("Failed to retrieve stored credentials: {}", e);
             return None;
         }
     };
@@ -282,7 +347,12 @@ fn execute_command(
                 let tx = msg_tx.clone();
                 tokio::spawn(async move {
                     match backend.fetch_email("INBOX", uid).await {
-                        Ok(email) => {
+                        Ok(mut email) => {
+                            // Fetch external images referenced in HTML body
+                            if let Some(html) = &email.body_html {
+                                let fetched = fetch_external_images(html).await;
+                                email.inline_images.extend(fetched);
+                            }
                             let _ = tx.send(Message::EmailFetched(Box::new(email)));
                         }
                         Err(e) => {
@@ -479,13 +549,13 @@ fn execute_command(
             tracing::info!("Saving account {}...", email);
             let tx = msg_tx.clone();
             tokio::spawn(async move {
-                // Store password in OS keyring
+                // Store password in credentials file
                 if let Err(e) = auth::token_store::store_token(&email, &password) {
-                    tracing::error!("Failed to store password in keyring: {}", e);
-                    let _ = tx.send(Message::SetupError(format!("Keyring error: {}", e)));
+                    tracing::error!("Failed to store credentials: {}", e);
+                    let _ = tx.send(Message::SetupError(format!("Credential store error: {}", e)));
                     return;
                 }
-                tracing::info!("Credentials stored in keyring");
+                tracing::info!("Credentials saved to local store");
 
                 tracing::info!("Writing account to config file...");
                 let account = models::account::Account {
@@ -510,7 +580,77 @@ fn execute_command(
     }
 }
 
-/// Read recent log lines from the termail log file on disk.
+/// Extract `<img src="https://...">` URLs from HTML and fetch them concurrently.
+/// Returns a map of URL -> image bytes for successfully fetched images.
+async fn fetch_external_images(html: &str) -> HashMap<String, Vec<u8>> {
+    // Extract URLs synchronously so `scraper::Html` (which is !Send) is
+    // dropped before any `.await` points.
+    let urls: Vec<String> = {
+        let document = scraper::Html::parse_fragment(html);
+        let img_selector = scraper::Selector::parse("img").unwrap();
+        document
+            .select(&img_selector)
+            .filter_map(|el| el.value().attr("src"))
+            .filter(|src| src.starts_with("https://") || src.starts_with("http://"))
+            .map(String::from)
+            .collect()
+    };
+
+    if urls.is_empty() {
+        return HashMap::new();
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    let fetches = urls.into_iter().map(|url| {
+        let client = client.clone();
+        async move {
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(bytes) if bytes.len() <= 5 * 1024 * 1024 => {
+                        tracing::debug!(
+                            "Fetched external image ({} bytes): {}",
+                            bytes.len(),
+                            url
+                        );
+                        Some((url, bytes.to_vec()))
+                    }
+                    Ok(bytes) => {
+                        tracing::debug!(
+                            "External image too large ({} bytes), skipping: {}",
+                            bytes.len(),
+                            url
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to read image body: {} - {}", url, e);
+                        None
+                    }
+                },
+                Ok(resp) => {
+                    tracing::debug!("External image HTTP {}: {}", resp.status(), url);
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to fetch external image: {} - {}", url, e);
+                    None
+                }
+            }
+        }
+    });
+
+    futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Read log lines from the current session's log file.
 /// Returns up to 1000 lines in reverse order (newest first).
 fn load_log_lines() -> Vec<String> {
     let data_dir = match config::data_dir() {
@@ -518,31 +658,7 @@ fn load_log_lines() -> Vec<String> {
         Err(_) => return vec!["Failed to resolve data directory".into()],
     };
 
-    // Try today's log file first
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let today_path = data_dir.join(format!("termail.log.{}", today));
-
-    let log_path = if today_path.exists() {
-        today_path
-    } else {
-        // Fall back to most recent termail.log.* file
-        let mut entries: Vec<_> = std::fs::read_dir(&data_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("termail.log")
-            })
-            .collect();
-        entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
-        match entries.first() {
-            Some(e) => e.path(),
-            None => return vec!["No log files found".into()],
-        }
-    };
+    let log_path = data_dir.join("termail.log");
 
     match std::fs::read_to_string(&log_path) {
         Ok(content) => {

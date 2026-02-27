@@ -3,8 +3,9 @@ use std::time::Instant;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
-use tachyonfx::fx::{self, Direction};
-use tachyonfx::{Duration, Effect, Shader};
+use tachyonfx::fx;
+use tachyonfx::Motion;
+use tachyonfx::{Duration, Effect};
 
 /// Manages active animation effects and advances them each tick.
 pub struct AnimationManager {
@@ -54,8 +55,8 @@ impl AnimationManager {
     /// Create a slide effect for scroll boundary bounce.
     pub fn bounce_effect(direction: BounceDirection) -> Effect {
         let dir = match direction {
-            BounceDirection::Up => Direction::UpToDown,
-            BounceDirection::Down => Direction::DownToUp,
+            BounceDirection::Up => Motion::UpToDown,
+            BounceDirection::Down => Motion::DownToUp,
         };
 
         fx::sequence(&[
@@ -74,7 +75,7 @@ impl AnimationManager {
     /// Create a sweep effect for pull-to-refresh.
     pub fn refresh_effect() -> Effect {
         fx::sweep_in(
-            Direction::LeftToRight,
+            Motion::LeftToRight,
             2,
             0,
             Color::Cyan,

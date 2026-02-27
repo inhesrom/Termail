@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 # TUI framework
-ratatui = { version = "0.29", features = ["all-widgets"] }
+ratatui = { version = "0.30", features = ["all-widgets", "crossterm_0_28"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
-tachyonfx = "0.9"
+tachyonfx = "0.24"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -35,12 +35,13 @@ tantivy = "0.22"
 # HTML to text (with CSS colour support for rich rendering)
 html2text = { version = "0.14", features = [] }
 
-# Terminal image rendering (Kitty/iTerm2/Sixel + unicode fallback)
-ratatui-image = "4"
-image = "0.25"
+# HTML5-compliant DOM parser for custom rich rendering
+scraper = "0.22"
+ego-tree = "0.10"
 
-# Credential storage
-keyring = { version = "3", features = ["apple-native", "linux-native"] }
+# Terminal image rendering (Kitty/iTerm2/Sixel + unicode fallback)
+ratatui-image = { path = "libs/ratatui-image", default-features = false, features = ["image-defaults", "crossterm"] }
+image = "0.25"
 
 # Config
 serde = { version = "1", features = ["derive"] }
@@ -75,6 +76,9 @@ base64 = "0.22"
 
 # Async std for async-imap compatibility
 async-std = "1"
+
+# HTTP client for fetching external images
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

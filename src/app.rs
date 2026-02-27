@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use chrono::Local;
@@ -162,11 +163,15 @@ pub struct App {
     pub account_email: String,
     pub has_accounts: bool,
     pub running: bool,
-    pub image_picker: Option<ratatui_image::picker::Picker>,
+    pub image_picker: ratatui_image::picker::Picker,
+    /// Cached `StatefulProtocol` instances for inline images, keyed by CID.
+    /// Uses `RefCell` for interior mutability so the render chain can work
+    /// with `&App`.
+    pub image_protocol_cache: RefCell<HashMap<String, ratatui_image::protocol::StatefulProtocol>>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(image_picker: ratatui_image::picker::Picker) -> Self {
         let config = crate::config::load_config().ok();
         let has_accounts = config
             .as_ref()
@@ -213,7 +218,8 @@ impl App {
             account_email,
             has_accounts,
             running: true,
-            image_picker: ratatui_image::picker::Picker::from_query_stdio().ok(),
+            image_picker,
+            image_protocol_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -592,6 +598,7 @@ impl App {
             Message::EmailFetched(email) => {
                 self.selected_email = Some(*email);
                 self.preview_scroll = 0;
+                self.image_protocol_cache.borrow_mut().clear();
             }
             Message::SearchResults(results) => {
                 if results.is_empty() {
@@ -648,6 +655,7 @@ impl App {
             self.selected_index -= 1;
         }
         self.selected_email = None;
+        self.image_protocol_cache.borrow_mut().clear();
         Some(uid)
     }
 }
@@ -851,7 +859,7 @@ mod tests {
 
     /// Create an App pre-loaded with dummy data for tests, regardless of config state.
     fn test_app() -> App {
-        let mut app = App::new();
+        let mut app = App::new(ratatui_image::picker::Picker::halfblocks());
         app.envelopes = dummy_envelopes();
         app.selected_email = Some(dummy_email());
         app.sync_status = SyncStatus::LastSync(Local::now());

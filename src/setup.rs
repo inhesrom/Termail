@@ -29,7 +29,7 @@ pub async fn run_setup() -> Result<()> {
 
     // Store password in OS keyring
     token_store::store_token(&email, &password)?;
-    println!("\nPassword stored securely in OS keyring.");
+    println!("\nPassword saved to local credentials file.");
 
     // Save account to config (no secrets in config file)
     let account = Account {
