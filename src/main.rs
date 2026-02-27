@@ -13,7 +13,7 @@ mod ui;
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -64,6 +64,16 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("termail=debug")
         .init();
 
+    // Open SQLite cache for instant startup and offline access
+    let db_cache: Option<Arc<Mutex<cache::CacheStore>>> =
+        match cache::CacheStore::open(&data_dir) {
+            Ok(store) => Some(Arc::new(Mutex::new(store))),
+            Err(e) => {
+                tracing::warn!("Cache open failed: {}", e);
+                None
+            }
+        };
+
     // Terminal setup — enter alternate screen first, but delay mouse capture
     // until after the image protocol probe. EnableMouseCapture causes the
     // terminal to send mouse events via stdin, which corrupts the
@@ -106,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     execute!(terminal.backend_mut(), EnableMouseCapture)?;
 
     // Run the app
-    let result = run(&mut terminal, image_picker).await;
+    let result = run(&mut terminal, image_picker, db_cache).await;
 
     // Terminal teardown (always runs, even on error)
     disable_raw_mode()?;
@@ -123,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     image_picker: ratatui_image::picker::Picker,
+    db_cache: Option<Arc<Mutex<cache::CacheStore>>>,
 ) -> anyhow::Result<()> {
     tracing::info!("Termail starting");
     let mut app = App::new(image_picker);
@@ -140,6 +151,20 @@ async fn run(
     // Channel for async command results to send messages back
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<Message>();
 
+    // Load cached envelopes for instant startup
+    if let Some(ref db_cache) = db_cache {
+        if app.has_accounts {
+            if let Ok(store) = db_cache.lock() {
+                if let Ok(envelopes) = cache::sqlite::load_envelopes(&store.conn, &app.account_email, "INBOX") {
+                    if !envelopes.is_empty() {
+                        app.envelopes = envelopes;
+                        app.sync_status = app::SyncStatus::LastSync(chrono::Local::now());
+                    }
+                }
+            }
+        }
+    }
+
     // Create IMAP backend if accounts exist at startup
     let mut imap_backend: Option<Arc<ImapBackend>> = if app.has_accounts {
         create_backend()
@@ -150,7 +175,7 @@ async fn run(
     // Trigger initial fetch if backend is ready
     if imap_backend.is_some() {
         tracing::info!("Starting initial inbox sync...");
-        execute_command(Command::FetchEnvelopes, &app, imap_backend.as_ref(), &msg_tx);
+        execute_command(Command::FetchEnvelopes, &app, imap_backend.as_ref(), db_cache.as_ref(), &msg_tx);
     } else if app.has_accounts {
         // Account exists but backend creation failed (likely missing credentials
         // after migrating from keyring to file-based store). Show error and
@@ -211,7 +236,7 @@ async fn run(
 
             // Trigger bounce effects at scroll boundaries
             match &msg {
-                Message::SelectPrevious if at_top => {
+                Message::SelectPrevious if at_top && app.active_pane == app::Pane::InboxList => {
                     animations.add_effect(
                         ui::animations::AnimationManager::bounce_effect(
                             ui::animations::BounceDirection::Up,
@@ -219,7 +244,7 @@ async fn run(
                         size,
                     );
                 }
-                Message::SelectNext if at_bottom => {
+                Message::SelectNext if at_bottom && app.active_pane == app::Pane::InboxList => {
                     animations.add_effect(
                         ui::animations::AnimationManager::bounce_effect(
                             ui::animations::BounceDirection::Down,
@@ -252,7 +277,7 @@ async fn run(
             // }
 
             for cmd in commands {
-                execute_command(cmd, &app, imap_backend.as_ref(), &msg_tx);
+                execute_command(cmd, &app, imap_backend.as_ref(), db_cache.as_ref(), &msg_tx);
             }
 
             // Destroy backend if account was reset
@@ -272,7 +297,7 @@ async fn run(
                         app.account_email = acct.email.clone();
                         tracing::info!("Starting inbox sync for {}...", acct.email);
                     }
-                    execute_command(Command::FetchEnvelopes, &app, imap_backend.as_ref(), &msg_tx);
+                    execute_command(Command::FetchEnvelopes, &app, imap_backend.as_ref(), db_cache.as_ref(), &msg_tx);
                 }
             }
         }
@@ -330,6 +355,7 @@ fn execute_command(
     cmd: Command,
     app: &App,
     backend: Option<&Arc<ImapBackend>>,
+    db_cache: Option<&Arc<Mutex<cache::CacheStore>>>,
     msg_tx: &mpsc::UnboundedSender<Message>,
 ) {
     match cmd {
@@ -342,9 +368,20 @@ fn execute_command(
             });
         }
         Command::FetchEmail(uid) => {
+            // Check cache first
+            if let Some(db_c) = db_cache {
+                if let Ok(store) = db_c.lock() {
+                    if let Ok(Some(email)) = cache::sqlite::load_email_body(&store.conn, &app.account_email, uid) {
+                        let _ = msg_tx.send(Message::EmailFetched(Box::new(email)));
+                        return;
+                    }
+                }
+            }
             if let Some(backend) = backend {
                 let backend = Arc::clone(backend);
                 let tx = msg_tx.clone();
+                let db_c = db_cache.cloned();
+                let account = app.account_email.clone();
                 tokio::spawn(async move {
                     match backend.fetch_email("INBOX", uid).await {
                         Ok(mut email) => {
@@ -352,6 +389,14 @@ fn execute_command(
                             if let Some(html) = &email.body_html {
                                 let fetched = fetch_external_images(html).await;
                                 email.inline_images.extend(fetched);
+                            }
+                            // Cache the email body
+                            if let Some(db_c) = &db_c {
+                                if let Ok(store) = db_c.lock() {
+                                    if let Err(e) = cache::sqlite::cache_email_body(&store.conn, &account, &email) {
+                                        tracing::warn!("Failed to cache email body uid={}: {}", uid, e);
+                                    }
+                                }
                             }
                             let _ = tx.send(Message::EmailFetched(Box::new(email)));
                         }
@@ -389,9 +434,19 @@ fn execute_command(
                 tracing::info!("Fetching inbox...");
                 let backend = Arc::clone(backend);
                 let tx = msg_tx.clone();
+                let db_c = db_cache.cloned();
+                let account = app.account_email.clone();
                 tokio::spawn(async move {
                     match backend.fetch_envelopes("INBOX", None, Some(50)).await {
                         Ok(envelopes) => {
+                            // Cache envelopes
+                            if let Some(db_c) = &db_c {
+                                if let Ok(store) = db_c.lock() {
+                                    if let Err(e) = cache::sync::sync_envelopes(&store.conn, &account, "INBOX", &envelopes) {
+                                        tracing::warn!("Failed to cache envelopes: {}", e);
+                                    }
+                                }
+                            }
                             let _ = tx.send(Message::EnvelopesFetched(envelopes));
                         }
                         Err(e) => {
@@ -434,10 +489,16 @@ fn execute_command(
             if let Some(backend) = backend {
                 let backend = Arc::clone(backend);
                 let tx = msg_tx.clone();
+                let db_c = db_cache.cloned();
                 tokio::spawn(async move {
                     match backend.delete_email("INBOX", uid).await {
                         Ok(()) => {
                             tracing::info!("Deleted email uid={}", uid);
+                            if let Some(db_c) = &db_c {
+                                if let Ok(store) = db_c.lock() {
+                                    let _ = cache::sqlite::delete_envelope(&store.conn, uid);
+                                }
+                            }
                             let _ = tx.send(Message::SyncComplete);
                         }
                         Err(e) => {
@@ -455,10 +516,16 @@ fn execute_command(
             if let Some(backend) = backend {
                 let backend = Arc::clone(backend);
                 let tx = msg_tx.clone();
+                let db_c = db_cache.cloned();
                 tokio::spawn(async move {
                     match backend.archive_email("INBOX", uid).await {
                         Ok(()) => {
                             tracing::info!("Archived email uid={}", uid);
+                            if let Some(db_c) = &db_c {
+                                if let Ok(store) = db_c.lock() {
+                                    let _ = cache::sqlite::delete_envelope(&store.conn, uid);
+                                }
+                            }
                             let _ = tx.send(Message::SyncComplete);
                         }
                         Err(e) => {
@@ -477,6 +544,7 @@ fn execute_command(
                 let backend = Arc::clone(backend);
                 let tx = msg_tx.clone();
                 let flag_str = flag.clone();
+                let db_c = db_cache.cloned();
                 let email_flag = match flag.as_str() {
                     "seen" => backend::EmailFlag::Seen,
                     "starred" => backend::EmailFlag::Starred,
@@ -490,6 +558,11 @@ fn execute_command(
                     match backend.set_flag("INBOX", uid, email_flag, value).await {
                         Ok(()) => {
                             tracing::info!("Set flag {}={} on uid={}", flag_str, value, uid);
+                            if let Some(db_c) = &db_c {
+                                if let Ok(store) = db_c.lock() {
+                                    let _ = cache::sqlite::update_envelope_flag(&store.conn, uid, &flag_str, value);
+                                }
+                            }
                             let _ = tx.send(Message::SyncComplete);
                         }
                         Err(e) => {

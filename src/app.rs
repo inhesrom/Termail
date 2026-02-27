@@ -228,25 +228,34 @@ impl App {
         match msg {
             // -- Navigation --
             Message::SelectNext => {
-                if !self.envelopes.is_empty() {
+                if self.active_pane == Pane::EmailPreview {
+                    self.preview_scroll = self.preview_scroll.saturating_add(1);
+                } else if !self.envelopes.is_empty() {
                     self.selected_index = (self.selected_index + 1).min(self.envelopes.len() - 1);
                     self.preview_scroll = 0;
-                    return vec![Command::FetchEmail(self.envelopes[self.selected_index].uid)];
                 }
             }
             Message::SelectPrevious => {
-                self.selected_index = self.selected_index.saturating_sub(1);
-                self.preview_scroll = 0;
-                if !self.envelopes.is_empty() {
-                    return vec![Command::FetchEmail(self.envelopes[self.selected_index].uid)];
+                if self.active_pane == Pane::EmailPreview {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(1);
+                } else {
+                    self.selected_index = self.selected_index.saturating_sub(1);
+                    self.preview_scroll = 0;
                 }
             }
             Message::OpenSelected => {
                 if let Some(env) = self.envelopes.get_mut(self.selected_index) {
+                    let uid = env.uid;
+                    let was_unread = !env.is_read;
                     env.is_read = true;
+                    self.active_pane = Pane::EmailPreview;
+                    self.preview_scroll = 0;
+                    let mut cmds = vec![Command::FetchEmail(uid)];
+                    if was_unread {
+                        cmds.push(Command::SetFlag { uid, flag: "seen".into(), value: true });
+                    }
+                    return cmds;
                 }
-                self.active_pane = Pane::EmailPreview;
-                self.preview_scroll = 0;
             }
             Message::SwitchPane => {
                 self.active_pane = match self.active_pane {
