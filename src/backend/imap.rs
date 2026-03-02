@@ -8,34 +8,43 @@ use futures::StreamExt;
 use imap_proto::types::Address as ImapAddress;
 use tokio::sync::Mutex;
 
-use crate::auth::google::{self, GoogleAuth};
+use crate::auth;
 use crate::backend::{EmailBackend, EmailFlag};
+use crate::models::account::{ProviderConfig, SmtpTlsMode};
 use crate::models::email::{Attachment, Email};
 use crate::models::envelope::Envelope;
 use crate::models::mailbox::Mailbox;
 
 type ImapSession = async_imap::Session<async_native_tls::TlsStream<async_std::net::TcpStream>>;
 
+/// Trait for obtaining OAuth2 access tokens, abstracting over provider-specific auth.
+#[async_trait]
+pub trait OAuthTokenSource: Send + Sync {
+    async fn get_access_token(&self) -> Result<String>;
+}
+
 /// Authentication credential for IMAP/SMTP connections.
 pub enum ImapCredential {
     /// OAuth2 XOAUTH2 authentication.
-    OAuth(Arc<GoogleAuth>),
+    OAuth(Arc<dyn OAuthTokenSource>),
     /// App password / PLAIN authentication.
     Password(String),
 }
 
-/// Gmail IMAP + SMTP backend.
+/// Provider-configurable IMAP + SMTP backend.
 pub struct ImapBackend {
     email: String,
     credential: ImapCredential,
+    provider_config: ProviderConfig,
     session: Mutex<Option<ImapSession>>,
 }
 
 impl ImapBackend {
-    pub fn new(email: String, credential: ImapCredential) -> Self {
+    pub fn new(email: String, credential: ImapCredential, provider_config: ProviderConfig) -> Self {
         Self {
             email,
             credential,
+            provider_config,
             session: Mutex::new(None),
         }
     }
@@ -63,12 +72,15 @@ impl ImapBackend {
         *guard = Some(session);
     }
 
-    /// Connect and authenticate to Gmail IMAP.
+    /// Connect and authenticate to the IMAP server.
     async fn connect(&self) -> Result<ImapSession> {
-        tracing::info!("Connecting to imap.gmail.com:993...");
+        let host = &self.provider_config.imap_host;
+        let port = self.provider_config.imap_port;
+        let addr = format!("{}:{}", host, port);
+        tracing::info!("Connecting to {}...", addr);
         let tls = async_native_tls::TlsConnector::new();
-        let tcp = async_std::net::TcpStream::connect("imap.gmail.com:993").await?;
-        let tls_stream = tls.connect("imap.gmail.com", tcp).await?;
+        let tcp = async_std::net::TcpStream::connect(&addr).await?;
+        let tls_stream = tls.connect(host, tcp).await?;
         tracing::info!("TLS connection established");
 
         let client = async_imap::Client::new(tls_stream);
@@ -87,7 +99,7 @@ impl ImapBackend {
             ImapCredential::OAuth(auth) => {
                 tracing::info!("Authenticating via OAuth for {}...", self.email);
                 let access_token = auth.get_access_token().await?;
-                let xoauth2 = google::build_xoauth2_string(&self.email, &access_token);
+                let xoauth2 = auth::build_xoauth2_string(&self.email, &access_token);
                 let session = client
                     .authenticate("XOAUTH2", XOAuth2Auth(xoauth2))
                     .await
@@ -287,6 +299,8 @@ impl EmailBackend for ImapBackend {
             .subject(subject)
             .body(body.to_string())?;
 
+        let smtp_host = &self.provider_config.smtp_host;
+
         match &self.credential {
             ImapCredential::Password(password) => {
                 let creds = lettre::transport::smtp::authentication::Credentials::new(
@@ -294,13 +308,25 @@ impl EmailBackend for ImapBackend {
                     password.clone(),
                 );
 
-                let mailer =
-                    lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::relay("smtp.gmail.com")?
-                        .credentials(creds)
-                        .authentication(vec![
-                            lettre::transport::smtp::authentication::Mechanism::Plain,
-                        ])
-                        .build();
+                let mailer = match self.provider_config.smtp_tls_mode {
+                    SmtpTlsMode::Implicit => {
+                        lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::relay(smtp_host)?
+                            .credentials(creds)
+                            .authentication(vec![
+                                lettre::transport::smtp::authentication::Mechanism::Plain,
+                            ])
+                            .build()
+                    }
+                    SmtpTlsMode::Starttls => {
+                        lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::starttls_relay(smtp_host)?
+                            .port(self.provider_config.smtp_port)
+                            .credentials(creds)
+                            .authentication(vec![
+                                lettre::transport::smtp::authentication::Mechanism::Plain,
+                            ])
+                            .build()
+                    }
+                };
 
                 use lettre::AsyncTransport;
                 mailer.send(email).await?;
@@ -313,13 +339,25 @@ impl EmailBackend for ImapBackend {
                     access_token,
                 );
 
-                let mailer =
-                    lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::relay("smtp.gmail.com")?
-                        .credentials(creds)
-                        .authentication(vec![
-                            lettre::transport::smtp::authentication::Mechanism::Xoauth2,
-                        ])
-                        .build();
+                let mailer = match self.provider_config.smtp_tls_mode {
+                    SmtpTlsMode::Implicit => {
+                        lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::relay(smtp_host)?
+                            .credentials(creds)
+                            .authentication(vec![
+                                lettre::transport::smtp::authentication::Mechanism::Xoauth2,
+                            ])
+                            .build()
+                    }
+                    SmtpTlsMode::Starttls => {
+                        lettre::AsyncSmtpTransport::<lettre::Tokio1Executor>::starttls_relay(smtp_host)?
+                            .port(self.provider_config.smtp_port)
+                            .credentials(creds)
+                            .authentication(vec![
+                                lettre::transport::smtp::authentication::Mechanism::Xoauth2,
+                            ])
+                            .build()
+                    }
+                };
 
                 use lettre::AsyncTransport;
                 mailer.send(email).await?;
@@ -348,7 +386,7 @@ impl EmailBackend for ImapBackend {
         let mut session = self.acquire_session().await?;
         session.select(mailbox).await?;
         session
-            .uid_mv(uid.to_string(), "[Gmail]/All Mail")
+            .uid_mv(uid.to_string(), &self.provider_config.archive_folder)
             .await?;
         self.return_session(session).await;
         Ok(())
@@ -422,7 +460,7 @@ impl EmailBackend for ImapBackend {
     }
 
     fn provider_name(&self) -> &str {
-        "Gmail"
+        &self.provider_config.imap_host
     }
 }
 
@@ -607,6 +645,7 @@ fn collect_inline_images(parsed: &mailparse::ParsedMail, images: &mut HashMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::account::Provider;
 
     fn test_credentials() -> (String, String) {
         let email = std::env::var("TERMAIL_TEST_EMAIL")
@@ -620,7 +659,11 @@ mod tests {
     #[ignore]
     async fn test_gmail_login() {
         let (email, password) = test_credentials();
-        let backend = ImapBackend::new(email, ImapCredential::Password(password));
+        let backend = ImapBackend::new(
+            email,
+            ImapCredential::Password(password),
+            Provider::Gmail.config(),
+        );
 
         match backend.connect().await {
             Ok(mut session) => {
@@ -641,7 +684,11 @@ mod tests {
     #[ignore]
     async fn test_gmail_list_mailboxes() {
         let (email, password) = test_credentials();
-        let backend = ImapBackend::new(email, ImapCredential::Password(password));
+        let backend = ImapBackend::new(
+            email,
+            ImapCredential::Password(password),
+            Provider::Gmail.config(),
+        );
 
         match backend.list_mailboxes().await {
             Ok(mailboxes) => {
@@ -670,7 +717,11 @@ mod tests {
     #[ignore]
     async fn test_gmail_fetch_envelopes() {
         let (email, password) = test_credentials();
-        let backend = ImapBackend::new(email, ImapCredential::Password(password));
+        let backend = ImapBackend::new(
+            email,
+            ImapCredential::Password(password),
+            Provider::Gmail.config(),
+        );
 
         match backend.fetch_envelopes("INBOX", None, Some(5)).await {
             Ok(envelopes) => {
@@ -697,7 +748,11 @@ mod tests {
     #[ignore]
     async fn test_gmail_fetch_email() {
         let (email, password) = test_credentials();
-        let backend = ImapBackend::new(email, ImapCredential::Password(password));
+        let backend = ImapBackend::new(
+            email,
+            ImapCredential::Password(password),
+            Provider::Gmail.config(),
+        );
 
         let envelopes = backend
             .fetch_envelopes("INBOX", None, Some(1))
@@ -734,7 +789,11 @@ mod tests {
     #[ignore]
     async fn test_gmail_set_flag() {
         let (email, password) = test_credentials();
-        let backend = ImapBackend::new(email, ImapCredential::Password(password));
+        let backend = ImapBackend::new(
+            email,
+            ImapCredential::Password(password),
+            Provider::Gmail.config(),
+        );
 
         let envelopes = backend
             .fetch_envelopes("INBOX", None, Some(1))
@@ -771,7 +830,11 @@ mod tests {
     #[ignore]
     async fn test_gmail_send_email() {
         let (email, password) = test_credentials();
-        let backend = ImapBackend::new(email.clone(), ImapCredential::Password(password));
+        let backend = ImapBackend::new(
+            email.clone(),
+            ImapCredential::Password(password),
+            Provider::Gmail.config(),
+        );
 
         backend
             .send_email(&email, "", "TermMail Test", "Automated test from TermMail test suite.")

@@ -70,6 +70,11 @@ pub fn default_config_template() -> &'static str {
 # name = "Personal Gmail"
 # email = "you@gmail.com"
 # provider = "gmail"
+
+# [[accounts]]
+# name = "Work Outlook"
+# email = "you@company.com"
+# provider = "outlook"
 "#
 }
 

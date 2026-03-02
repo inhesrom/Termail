@@ -329,25 +329,59 @@ fn create_backend() -> Option<Arc<ImapBackend>> {
             return None;
         }
     };
-    tracing::info!("Found account: {}", account.email);
-    tracing::info!("Retrieving stored credentials...");
-    let password = match auth::token_store::get_token(&account.email) {
-        Ok(Some(pw)) => pw,
-        Ok(None) => {
-            tracing::warn!("No stored credentials found for {}", account.email);
-            return None;
+    tracing::info!("Found account: {} ({})", account.email, account.provider.display_name());
+    let provider_config = account.provider.config();
+
+    match &account.provider {
+        models::account::Provider::Gmail => {
+            tracing::info!("Retrieving stored credentials...");
+            let password = match auth::token_store::get_token(&account.email) {
+                Ok(Some(pw)) => pw,
+                Ok(None) => {
+                    tracing::warn!("No stored credentials found for {}", account.email);
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to retrieve stored credentials: {}", e);
+                    return None;
+                }
+            };
+            let backend = ImapBackend::new(
+                account.email.clone(),
+                ImapCredential::Password(password),
+                provider_config,
+            );
+            tracing::info!("IMAP backend created for {}", account.email);
+            Some(Arc::new(backend))
         }
-        Err(e) => {
-            tracing::warn!("Failed to retrieve stored credentials: {}", e);
-            return None;
+        models::account::Provider::Outlook => {
+            // Outlook uses OAuth2 — check for cached token file
+            let data_dir = match config::data_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Failed to resolve data directory: {}", e);
+                    return None;
+                }
+            };
+            let client_id = account.client_id.clone()
+                .unwrap_or_else(|| auth::microsoft::DEFAULT_CLIENT_ID.to_string());
+            match auth::microsoft::MicrosoftAuth::load_blocking(&data_dir, &account.email, &client_id) {
+                Ok(ms_auth) => {
+                    let backend = ImapBackend::new(
+                        account.email.clone(),
+                        ImapCredential::OAuth(std::sync::Arc::new(ms_auth)),
+                        provider_config,
+                    );
+                    tracing::info!("IMAP (Outlook OAuth) backend created for {}", account.email);
+                    Some(Arc::new(backend))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load Microsoft OAuth for {}: {}", account.email, e);
+                    None
+                }
+            }
         }
-    };
-    let backend = ImapBackend::new(
-        account.email.clone(),
-        ImapCredential::Password(password),
-    );
-    tracing::info!("IMAP backend created for {}", account.email);
-    Some(Arc::new(backend))
+    }
 }
 
 /// Execute a command (side effect). For async commands, spawns a task that
@@ -651,6 +685,107 @@ fn execute_command(
                     }
                 }
             });
+        }
+        Command::StartOutlookAuth { name, email, client_id } => {
+            tracing::info!("Starting Outlook OAuth for {}...", email);
+            let tx = msg_tx.clone();
+            let email_clone = email.clone();
+            let name_clone = name.clone();
+            tokio::spawn(async move {
+                let data_dir = match config::data_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = tx.send(Message::SetupError(format!("Data dir error: {}", e)));
+                        return;
+                    }
+                };
+                let cid = client_id.unwrap_or_else(|| auth::microsoft::DEFAULT_CLIENT_ID.to_string());
+                match auth::microsoft::MicrosoftAuth::new_with_device_code(&data_dir, &email_clone, &cid).await {
+                    Ok((ms_auth, mut code_rx)) => {
+                        // Relay device code info to the TUI
+                        if let Some(info) = code_rx.recv().await {
+                            let _ = tx.send(Message::SetupDeviceCodeReceived {
+                                verification_uri: info.verification_uri,
+                                user_code: info.user_code,
+                            });
+                        }
+                        // Request a token — this blocks until the user completes browser auth
+                        match ms_auth.get_access_token().await {
+                            Ok(_token) => {
+                                tracing::info!("Outlook OAuth complete for {}", email_clone);
+                                // Save account to config
+                                let account = models::account::Account {
+                                    name: name_clone,
+                                    email: email_clone,
+                                    provider: models::account::Provider::Outlook,
+                                    client_id: None,
+                                    client_secret: None,
+                                };
+                                match setup::append_account_to_config(&account) {
+                                    Ok(()) => {
+                                        tracing::info!("Outlook account saved: {}", account.email);
+                                        let _ = tx.send(Message::SetupComplete);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to save Outlook account: {}", e);
+                                        let _ = tx.send(Message::SetupError(e.to_string()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Outlook OAuth failed for {}: {}", email_clone, e);
+                                let _ = tx.send(Message::SetupError(format!("Auth failed: {}", e)));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create Microsoft authenticator: {}", e);
+                        let _ = tx.send(Message::SetupError(format!("Auth setup error: {}", e)));
+                    }
+                }
+            });
+        }
+        Command::SaveOutlookAccount { name, email, client_id: _ } => {
+            tracing::info!("Saving Outlook account {}...", email);
+            let tx = msg_tx.clone();
+            tokio::spawn(async move {
+                let account = models::account::Account {
+                    name,
+                    email,
+                    provider: models::account::Provider::Outlook,
+                    client_id: None,
+                    client_secret: None,
+                };
+                match setup::append_account_to_config(&account) {
+                    Ok(()) => {
+                        tracing::info!("Outlook account saved: {}", account.email);
+                        let _ = tx.send(Message::SetupComplete);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to save Outlook account: {}", e);
+                        let _ = tx.send(Message::SetupError(e.to_string()));
+                    }
+                }
+            });
+        }
+        Command::RemoveAccount { email } => {
+            tracing::info!("Removing account {}...", email);
+            // Delete stored credentials
+            if let Err(e) = auth::token_store::delete_token(&email) {
+                tracing::warn!("Failed to delete token for {}: {}", email, e);
+            }
+            // Delete Microsoft OAuth token file if it exists
+            if let Ok(data_dir) = config::data_dir() {
+                if let Err(e) = auth::microsoft::MicrosoftAuth::delete_token_file(&data_dir, &email) {
+                    tracing::warn!("Failed to delete Microsoft token for {}: {}", email, e);
+                }
+            }
+            // Remove from config
+            if let Err(e) = setup::remove_single_account_from_config(&email) {
+                tracing::error!("Failed to remove account from config: {}", e);
+            }
+            // Reload account list in setup UI
+            let _ = msg_tx.send(Message::SetupComplete);
         }
     }
 }

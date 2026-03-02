@@ -15,23 +15,27 @@ pub async fn run_setup() -> Result<()> {
     let email = prompt("Email address: ")?;
 
     let provider = detect_provider(&email);
+    println!("\nDetected provider: {}", provider.display_name());
+
     match &provider {
-        Provider::Gmail => println!("\nDetected provider: Gmail"),
+        Provider::Gmail => {
+            println!("\nTo create an App Password:");
+            println!("  1. Go to myaccount.google.com");
+            println!("  2. Security → 2-Step Verification");
+            println!("  3. App passwords → Create one");
+            println!();
+
+            let password = prompt("App Password: ")?;
+
+            token_store::store_token(&email, &password)?;
+            println!("\nPassword saved to local credentials file.");
+        }
+        Provider::Outlook => {
+            println!("\nOutlook 365 uses OAuth2 device code flow.");
+            println!("You will be prompted to sign in when you launch the TUI.");
+        }
     }
 
-    println!("\nTo create an App Password:");
-    println!("  1. Go to myaccount.google.com");
-    println!("  2. Security → 2-Step Verification");
-    println!("  3. App passwords → Create one");
-    println!();
-
-    let password = prompt("App Password: ")?;
-
-    // Store password in OS keyring
-    token_store::store_token(&email, &password)?;
-    println!("\nPassword saved to local credentials file.");
-
-    // Save account to config (no secrets in config file)
     let account = Account {
         name,
         email,
@@ -55,9 +59,18 @@ fn prompt(message: &str) -> Result<String> {
 }
 
 /// Auto-detect the email provider from the domain.
-/// TODO: detect provider from domain once multiple providers are supported.
-fn detect_provider(_email: &str) -> Provider {
-    Provider::Gmail
+fn detect_provider(email: &str) -> Provider {
+    let domain = email.rsplit('@').next().unwrap_or("").to_lowercase();
+    if domain.ends_with("outlook.com")
+        || domain.ends_with("hotmail.com")
+        || domain.ends_with("live.com")
+        || domain.ends_with("office365.com")
+        || domain.ends_with("microsoft.com")
+    {
+        Provider::Outlook
+    } else {
+        Provider::Gmail
+    }
 }
 
 /// Remove all accounts from the config file, resetting it to the default template.
@@ -65,6 +78,40 @@ pub fn remove_account_from_config() -> Result<()> {
     tracing::debug!("Removing all accounts from config");
     let config_path = config::config_dir()?.join("config.toml");
     remove_account_from_config_at(&config_path)
+}
+
+/// Remove a single account by email from the config file.
+pub fn remove_single_account_from_config(email: &str) -> Result<()> {
+    tracing::debug!("Removing account {} from config", email);
+    let config_path = config::config_dir()?.join("config.toml");
+    remove_single_account_at(&config_path, email)
+}
+
+/// Remove a single account by email from a specific config file.
+fn remove_single_account_at(config_path: &std::path::Path, email: &str) -> Result<()> {
+    let cfg = config::load_config_from(config_path)?;
+    let remaining: Vec<_> = cfg.accounts.iter().filter(|a| a.email != email).cloned().collect();
+
+    if remaining.is_empty() {
+        // No accounts left — reset to default template
+        std::fs::write(config_path, config::default_config_template())
+            .context("Failed to write config file")?;
+    } else {
+        // Rebuild config with remaining accounts
+        #[derive(serde::Serialize)]
+        struct ConfigOut {
+            accounts: Vec<Account>,
+        }
+        let serialized = toml::to_string(&ConfigOut { accounts: remaining })
+            .context("Failed to serialize config")?;
+        let header = format!(
+            "# Termail Configuration\n# tick_rate_ms = {}\n# inbox_width_percent = {}\n\n",
+            cfg.tick_rate_ms, cfg.inbox_width_percent
+        );
+        std::fs::write(config_path, format!("{}{}", header, serialized))
+            .context("Failed to write config file")?;
+    }
+    Ok(())
 }
 
 /// Remove all accounts from a specific config file path.

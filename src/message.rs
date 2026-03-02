@@ -44,6 +44,12 @@ pub enum Message {
     SetupCancel,
     SetupComplete,
     SetupError(String),
+    SetupBack,
+    SetupUp,
+    SetupDown,
+    SetupDeviceCodeReceived { verification_uri: String, user_code: String },
+    SetupOutlookAuthComplete,
+    SetupRemoveAccount(usize),
     ResetAccount,
 
     // Log Viewer

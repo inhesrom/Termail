@@ -43,22 +43,77 @@ pub enum ComposeField {
     Body,
 }
 
-/// Which field is active in the setup overlay.
+/// Which field is active in a Gmail setup form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetupField {
+pub enum GmailSetupField {
     Name,
     Email,
     Password,
     Submit,
 }
 
-/// Setup form state.
+/// Which field is active in an Outlook setup form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlookSetupField {
+    Name,
+    Email,
+    Submit,
+}
+
+/// Provider choice in the provider selection screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOption {
+    Gmail,
+    Outlook,
+}
+
+/// Items shown in the account list.
 #[derive(Debug, Clone)]
-pub struct SetupState {
+pub struct AccountListItem {
     pub name: String,
     pub email: String,
-    pub password: String,
-    pub active_field: SetupField,
+    pub provider: crate::models::account::Provider,
+}
+
+/// The current phase of the multi-step setup flow.
+#[derive(Debug, Clone)]
+pub enum SetupPhase {
+    /// Shows existing accounts + "Add Account" + "Done".
+    AccountList {
+        accounts: Vec<AccountListItem>,
+        /// Index into: [account0, account1, ..., AddAccount, Done]
+        selected: usize,
+    },
+    /// Choose Gmail or Outlook.
+    ProviderSelect {
+        selected: ProviderOption,
+    },
+    /// Gmail-specific fields: name, email, app password.
+    GmailFields {
+        name: String,
+        email: String,
+        password: String,
+        active_field: GmailSetupField,
+    },
+    /// Outlook-specific fields: name, email (no password).
+    OutlookFields {
+        name: String,
+        email: String,
+        active_field: OutlookSetupField,
+    },
+    /// Displaying device code, waiting for user to authenticate in browser.
+    OutlookDeviceCode {
+        name: String,
+        email: String,
+        verification_uri: String,
+        user_code: String,
+    },
+}
+
+/// Setup overlay state.
+#[derive(Debug, Clone)]
+pub struct SetupState {
+    pub phase: SetupPhase,
     pub status: Option<String>,
 }
 
@@ -132,6 +187,9 @@ pub enum Command {
     SetFlag { uid: u32, flag: String, value: bool },
     Search(String),
     SaveAccount { name: String, email: String, password: String },
+    SaveOutlookAccount { name: String, email: String, client_id: Option<String> },
+    StartOutlookAuth { name: String, email: String, client_id: Option<String> },
+    RemoveAccount { email: String },
     ResetAccount { email: String },
     LoadLogs,
     Quit,
@@ -182,10 +240,9 @@ impl App {
 
         let setup = if !has_accounts {
             Some(SetupState {
-                name: String::new(),
-                email: String::new(),
-                password: String::new(),
-                active_field: SetupField::Name,
+                phase: SetupPhase::ProviderSelect {
+                    selected: ProviderOption::Gmail,
+                },
                 status: None,
             })
         } else {
@@ -481,85 +538,354 @@ impl App {
 
             // -- Setup --
             Message::OpenSetup => {
-                self.setup = Some(SetupState {
-                    name: String::new(),
-                    email: String::new(),
-                    password: String::new(),
-                    active_field: SetupField::Name,
-                    status: None,
-                });
+                let accounts = load_account_list();
+                if accounts.is_empty() {
+                    self.setup = Some(SetupState {
+                        phase: SetupPhase::ProviderSelect {
+                            selected: ProviderOption::Gmail,
+                        },
+                        status: None,
+                    });
+                } else {
+                    self.setup = Some(SetupState {
+                        phase: SetupPhase::AccountList {
+                            accounts,
+                            selected: 0,
+                        },
+                        status: None,
+                    });
+                }
             }
             Message::SetupInput(ch) => {
-                if let Some(setup) = &mut self.setup
-                    && setup.active_field != SetupField::Submit
-                {
-                    active_setup_field_mut(setup).push(ch);
+                if let Some(setup) = &mut self.setup {
+                    match &mut setup.phase {
+                        SetupPhase::GmailFields { name, email, password, active_field } => {
+                            match active_field {
+                                GmailSetupField::Name => name.push(ch),
+                                GmailSetupField::Email => email.push(ch),
+                                GmailSetupField::Password => password.push(ch),
+                                GmailSetupField::Submit => {}
+                            }
+                        }
+                        SetupPhase::OutlookFields { name, email, active_field } => {
+                            match active_field {
+                                OutlookSetupField::Name => name.push(ch),
+                                OutlookSetupField::Email => email.push(ch),
+                                OutlookSetupField::Submit => {}
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Message::SetupBackspace => {
-                if let Some(setup) = &mut self.setup
-                    && setup.active_field != SetupField::Submit
-                {
-                    active_setup_field_mut(setup).pop();
+                if let Some(setup) = &mut self.setup {
+                    match &mut setup.phase {
+                        SetupPhase::GmailFields { name, email, password, active_field } => {
+                            match active_field {
+                                GmailSetupField::Name => { name.pop(); }
+                                GmailSetupField::Email => { email.pop(); }
+                                GmailSetupField::Password => { password.pop(); }
+                                GmailSetupField::Submit => {}
+                            }
+                        }
+                        SetupPhase::OutlookFields { name, email, active_field } => {
+                            match active_field {
+                                OutlookSetupField::Name => { name.pop(); }
+                                OutlookSetupField::Email => { email.pop(); }
+                                OutlookSetupField::Submit => {}
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             Message::SetupTabField => {
                 if let Some(setup) = &mut self.setup {
-                    setup.active_field = match setup.active_field {
-                        SetupField::Name => SetupField::Email,
-                        SetupField::Email => SetupField::Password,
-                        SetupField::Password => SetupField::Submit,
-                        SetupField::Submit => SetupField::Name,
-                    };
+                    match &mut setup.phase {
+                        SetupPhase::GmailFields { active_field, .. } => {
+                            *active_field = match active_field {
+                                GmailSetupField::Name => GmailSetupField::Email,
+                                GmailSetupField::Email => GmailSetupField::Password,
+                                GmailSetupField::Password => GmailSetupField::Submit,
+                                GmailSetupField::Submit => GmailSetupField::Name,
+                            };
+                        }
+                        SetupPhase::OutlookFields { active_field, .. } => {
+                            *active_field = match active_field {
+                                OutlookSetupField::Name => OutlookSetupField::Email,
+                                OutlookSetupField::Email => OutlookSetupField::Submit,
+                                OutlookSetupField::Submit => OutlookSetupField::Name,
+                            };
+                        }
+                        _ => {}
+                    }
                 }
             }
             Message::SetupSubmit => {
                 if let Some(setup) = &mut self.setup {
-                    if setup.name.is_empty() || setup.email.is_empty()
-                        || setup.password.is_empty()
-                    {
-                        setup.status = Some("All fields are required".into());
-                    } else {
-                        return vec![Command::SaveAccount {
-                            name: setup.name.clone(),
-                            email: setup.email.clone(),
-                            password: setup.password.clone(),
-                        }];
+                    match &setup.phase {
+                        SetupPhase::GmailFields { name, email, password, .. } => {
+                            if name.is_empty() || email.is_empty() || password.is_empty() {
+                                setup.status = Some("All fields are required".into());
+                            } else {
+                                return vec![Command::SaveAccount {
+                                    name: name.clone(),
+                                    email: email.clone(),
+                                    password: password.clone(),
+                                }];
+                            }
+                        }
+                        SetupPhase::OutlookFields { name, email, .. } => {
+                            if name.is_empty() || email.is_empty() {
+                                setup.status = Some("Name and email are required".into());
+                            } else {
+                                let name = name.clone();
+                                let email = email.clone();
+                                return vec![Command::StartOutlookAuth {
+                                    name,
+                                    email,
+                                    client_id: None,
+                                }];
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             Message::SetupEnter => {
                 if let Some(setup) = &mut self.setup {
-                    if setup.active_field == SetupField::Submit {
-                        // Enter on Submit button triggers save
-                        if setup.name.is_empty() || setup.email.is_empty()
-                            || setup.password.is_empty()
-                        {
-                            setup.status = Some("All fields are required".into());
-                        } else {
-                            return vec![Command::SaveAccount {
-                                name: setup.name.clone(),
-                                email: setup.email.clone(),
-                                password: setup.password.clone(),
-                            }];
+                    setup.status = None;
+                    match &mut setup.phase {
+                        SetupPhase::AccountList { accounts, selected } => {
+                            let num_accounts = accounts.len();
+                            if *selected == num_accounts {
+                                // "Add Account" button
+                                setup.phase = SetupPhase::ProviderSelect {
+                                    selected: ProviderOption::Gmail,
+                                };
+                            } else if *selected == num_accounts + 1 {
+                                // "Done" button
+                                self.setup = None;
+                                return vec![Command::None];
+                            } else {
+                                // Selected an existing account — could show details or remove
+                                // For now, treat enter on an account as remove
+                                let email = accounts[*selected].email.clone();
+                                return vec![Command::RemoveAccount { email }];
+                            }
                         }
-                    } else {
-                        // Enter on text fields advances to next field
-                        setup.active_field = match setup.active_field {
-                            SetupField::Name => SetupField::Email,
-                            SetupField::Email => SetupField::Password,
-                            SetupField::Password => SetupField::Submit,
-                            SetupField::Submit => SetupField::Name,
-                        };
+                        SetupPhase::ProviderSelect { selected } => {
+                            match selected {
+                                ProviderOption::Gmail => {
+                                    setup.phase = SetupPhase::GmailFields {
+                                        name: String::new(),
+                                        email: String::new(),
+                                        password: String::new(),
+                                        active_field: GmailSetupField::Name,
+                                    };
+                                }
+                                ProviderOption::Outlook => {
+                                    setup.phase = SetupPhase::OutlookFields {
+                                        name: String::new(),
+                                        email: String::new(),
+                                        active_field: OutlookSetupField::Name,
+                                    };
+                                }
+                            }
+                        }
+                        SetupPhase::GmailFields { name, email, password, active_field } => {
+                            if *active_field == GmailSetupField::Submit {
+                                if name.is_empty() || email.is_empty() || password.is_empty() {
+                                    setup.status = Some("All fields are required".into());
+                                } else {
+                                    return vec![Command::SaveAccount {
+                                        name: name.clone(),
+                                        email: email.clone(),
+                                        password: password.clone(),
+                                    }];
+                                }
+                            } else {
+                                *active_field = match active_field {
+                                    GmailSetupField::Name => GmailSetupField::Email,
+                                    GmailSetupField::Email => GmailSetupField::Password,
+                                    GmailSetupField::Password => GmailSetupField::Submit,
+                                    GmailSetupField::Submit => GmailSetupField::Name,
+                                };
+                            }
+                        }
+                        SetupPhase::OutlookFields { name, email, active_field } => {
+                            if *active_field == OutlookSetupField::Submit {
+                                if name.is_empty() || email.is_empty() {
+                                    setup.status = Some("Name and email are required".into());
+                                } else {
+                                    return vec![Command::StartOutlookAuth {
+                                        name: name.clone(),
+                                        email: email.clone(),
+                                        client_id: None,
+                                    }];
+                                }
+                            } else {
+                                *active_field = match active_field {
+                                    OutlookSetupField::Name => OutlookSetupField::Email,
+                                    OutlookSetupField::Email => OutlookSetupField::Submit,
+                                    OutlookSetupField::Submit => OutlookSetupField::Name,
+                                };
+                            }
+                        }
+                        SetupPhase::OutlookDeviceCode { .. } => {
+                            // Waiting for auth — enter does nothing
+                        }
+                    }
+                }
+            }
+            Message::SetupUp => {
+                if let Some(setup) = &mut self.setup {
+                    match &mut setup.phase {
+                        SetupPhase::AccountList { accounts: _, selected } => {
+                            if *selected > 0 {
+                                *selected -= 1;
+                            }
+                        }
+                        SetupPhase::ProviderSelect { selected } => {
+                            *selected = ProviderOption::Gmail;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::SetupDown => {
+                if let Some(setup) = &mut self.setup {
+                    match &mut setup.phase {
+                        SetupPhase::AccountList { accounts, selected } => {
+                            let max = accounts.len() + 1; // accounts + AddAccount + Done
+                            if *selected < max {
+                                *selected += 1;
+                            }
+                        }
+                        SetupPhase::ProviderSelect { selected } => {
+                            *selected = ProviderOption::Outlook;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::SetupBack => {
+                if let Some(setup) = &mut self.setup {
+                    let has_accounts = load_account_list().len() > 0;
+                    match &setup.phase {
+                        SetupPhase::AccountList { .. } => {
+                            // Can't go back from account list
+                            self.setup = None;
+                        }
+                        SetupPhase::ProviderSelect { .. } => {
+                            if has_accounts {
+                                let accounts = load_account_list();
+                                setup.phase = SetupPhase::AccountList { accounts, selected: 0 };
+                            } else {
+                                self.setup = None;
+                            }
+                        }
+                        SetupPhase::GmailFields { .. } | SetupPhase::OutlookFields { .. } => {
+                            setup.phase = SetupPhase::ProviderSelect {
+                                selected: ProviderOption::Gmail,
+                            };
+                            setup.status = None;
+                        }
+                        SetupPhase::OutlookDeviceCode { .. } => {
+                            setup.phase = SetupPhase::ProviderSelect {
+                                selected: ProviderOption::Outlook,
+                            };
+                            setup.status = None;
+                        }
                     }
                 }
             }
             Message::SetupCancel => {
-                self.setup = None;
+                // Esc: go back one step, or close
+                if let Some(setup) = &self.setup {
+                    match &setup.phase {
+                        SetupPhase::AccountList { .. } => {
+                            self.setup = None;
+                        }
+                        SetupPhase::ProviderSelect { .. } => {
+                            let accounts = load_account_list();
+                            if accounts.is_empty() {
+                                self.setup = None;
+                            } else {
+                                self.setup = Some(SetupState {
+                                    phase: SetupPhase::AccountList { accounts, selected: 0 },
+                                    status: None,
+                                });
+                            }
+                        }
+                        _ => {
+                            return self.update(Message::SetupBack);
+                        }
+                    }
+                }
+            }
+            Message::SetupDeviceCodeReceived { verification_uri, user_code } => {
+                if let Some(setup) = &mut self.setup {
+                    // Capture name/email from OutlookFields before transitioning
+                    let (name, email) = match &setup.phase {
+                        SetupPhase::OutlookFields { name, email, .. } => {
+                            (name.clone(), email.clone())
+                        }
+                        SetupPhase::OutlookDeviceCode { name, email, .. } => {
+                            (name.clone(), email.clone())
+                        }
+                        _ => (String::new(), String::new()),
+                    };
+                    setup.phase = SetupPhase::OutlookDeviceCode {
+                        name,
+                        email,
+                        verification_uri,
+                        user_code,
+                    };
+                    setup.status = None;
+                }
+            }
+            Message::SetupOutlookAuthComplete => {
+                if let Some(setup) = &self.setup {
+                    if let SetupPhase::OutlookDeviceCode { name, email, .. } = &setup.phase {
+                        let name = name.clone();
+                        let email = email.clone();
+                        return vec![Command::SaveOutlookAccount {
+                            name,
+                            email,
+                            client_id: None,
+                        }];
+                    }
+                }
+            }
+            Message::SetupRemoveAccount(index) => {
+                let accounts = load_account_list();
+                if let Some(acct) = accounts.get(index) {
+                    let email = acct.email.clone();
+                    return vec![Command::RemoveAccount { email }];
+                }
             }
             Message::SetupComplete => {
-                self.has_accounts = true;
-                self.setup = None;
+                // Reload account list — if still in setup, go back to account list
+                let accounts = load_account_list();
+                self.has_accounts = !accounts.is_empty();
+                if self.has_accounts {
+                    // Update account_email from config
+                    if let Ok(cfg) = crate::config::load_config()
+                        && let Some(acct) = cfg.accounts.first()
+                    {
+                        self.account_email = acct.email.clone();
+                    }
+                }
+                if accounts.is_empty() {
+                    self.setup = None;
+                } else {
+                    self.setup = Some(SetupState {
+                        phase: SetupPhase::AccountList { accounts, selected: 0 },
+                        status: Some("Account saved!".into()),
+                    });
+                }
                 self.envelopes.clear();
                 self.selected_email = None;
                 self.sync_status = SyncStatus::Syncing;
@@ -578,10 +904,9 @@ impl App {
                 self.selected_index = 0;
                 self.sync_status = SyncStatus::Idle;
                 self.setup = Some(SetupState {
-                    name: String::new(),
-                    email: String::new(),
-                    password: String::new(),
-                    active_field: SetupField::Name,
+                    phase: SetupPhase::ProviderSelect {
+                        selected: ProviderOption::Gmail,
+                    },
                     status: None,
                 });
                 return vec![Command::ResetAccount { email }];
@@ -785,14 +1110,21 @@ fn active_compose_field_mut(compose: &mut ComposeState) -> &mut String {
     }
 }
 
-/// Return a mutable reference to the currently active setup field's string.
-fn active_setup_field_mut(setup: &mut SetupState) -> &mut String {
-    match setup.active_field {
-        SetupField::Name => &mut setup.name,
-        SetupField::Email => &mut setup.email,
-        SetupField::Password => &mut setup.password,
-        SetupField::Submit => unreachable!("Submit field has no text input"),
-    }
+/// Load the account list from config for the setup UI.
+fn load_account_list() -> Vec<AccountListItem> {
+    crate::config::load_config()
+        .ok()
+        .map(|cfg| {
+            cfg.accounts
+                .into_iter()
+                .map(|a| AccountListItem {
+                    name: a.name,
+                    email: a.email,
+                    provider: a.provider,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Generate dummy envelopes for Phase 1 visual development.
@@ -1235,10 +1567,10 @@ mod tests {
         assert_eq!(app.selected_index, 0);
         assert!(matches!(app.sync_status, SyncStatus::Idle));
 
-        // Setup wizard should be open
+        // Setup wizard should be open at provider select
         assert!(app.setup.is_some());
         let setup = app.setup.as_ref().unwrap();
-        assert_eq!(setup.active_field, SetupField::Name);
+        assert!(matches!(setup.phase, SetupPhase::ProviderSelect { .. }));
 
         // Should return ResetAccount command with the old email
         assert!(commands

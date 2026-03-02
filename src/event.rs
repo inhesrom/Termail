@@ -160,6 +160,8 @@ fn convert_setup_key(key: event::KeyEvent) -> Option<Message> {
         (KeyModifiers::NONE, KeyCode::Enter) => Some(Message::SetupEnter),
         (KeyModifiers::NONE, KeyCode::Tab) => Some(Message::SetupTabField),
         (KeyModifiers::NONE, KeyCode::Backspace) => Some(Message::SetupBackspace),
+        (KeyModifiers::NONE, KeyCode::Up) => Some(Message::SetupUp),
+        (KeyModifiers::NONE, KeyCode::Down) => Some(Message::SetupDown),
         (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
             Some(Message::SetupInput(c))
         }
