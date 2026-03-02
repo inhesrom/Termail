@@ -369,15 +369,15 @@ fn execute_command(
             });
         }
         Command::FetchEmail(uid) => {
-            // Check cache first
+            // Check cache first for instant text display
             if let Some(db_c) = db_cache {
                 if let Ok(store) = db_c.lock() {
                     if let Ok(Some(email)) = cache::sqlite::load_email_body(&store.conn, &app.account_email, uid) {
                         let _ = msg_tx.send(Message::EmailFetched(Box::new(email)));
-                        return;
                     }
                 }
             }
+            // Always fetch from IMAP (for images, or if cache missed)
             if let Some(backend) = backend {
                 let backend = Arc::clone(backend);
                 let tx = msg_tx.clone();
@@ -386,12 +386,12 @@ fn execute_command(
                 tokio::spawn(async move {
                     match backend.fetch_email("INBOX", uid).await {
                         Ok(mut email) => {
-                            // Fetch external images referenced in HTML body
+                            // Fetch external images before sending
                             if let Some(html) = &email.body_html {
                                 let fetched = fetch_external_images(html).await;
                                 email.inline_images.extend(fetched);
                             }
-                            // Cache the email body
+                            // Cache the complete email (with images)
                             if let Some(db_c) = &db_c {
                                 if let Ok(store) = db_c.lock() {
                                     if let Err(e) = cache::sqlite::cache_email_body(&store.conn, &account, &email) {
@@ -399,6 +399,7 @@ fn execute_command(
                                     }
                                 }
                             }
+                            // Send complete email with all images
                             let _ = tx.send(Message::EmailFetched(Box::new(email)));
                         }
                         Err(e) => {

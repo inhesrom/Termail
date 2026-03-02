@@ -668,6 +668,8 @@ impl App {
                     self.selected_index = 0;
                 }
             }
+            // May fire twice per open: once from cache (fast, text-only) then
+            // again from IMAP (complete, with images). Overwrite is intentional.
             Message::EmailFetched(email) => {
                 self.selected_email = Some(*email);
                 self.preview_scroll = 0;

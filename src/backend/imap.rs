@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use futures::StreamExt;
 use imap_proto::types::Address as ImapAddress;
+use tokio::sync::Mutex;
 
 use crate::auth::google::{self, GoogleAuth};
 use crate::backend::{EmailBackend, EmailFlag};
@@ -27,11 +28,39 @@ pub enum ImapCredential {
 pub struct ImapBackend {
     email: String,
     credential: ImapCredential,
+    session: Mutex<Option<ImapSession>>,
 }
 
 impl ImapBackend {
     pub fn new(email: String, credential: ImapCredential) -> Self {
-        Self { email, credential }
+        Self {
+            email,
+            credential,
+            session: Mutex::new(None),
+        }
+    }
+
+    /// Acquire an IMAP session — reuse a cached one if alive, otherwise connect fresh.
+    async fn acquire_session(&self) -> Result<ImapSession> {
+        let cached = self.session.lock().await.take();
+        if let Some(mut session) = cached {
+            match session.noop().await {
+                Ok(_) => {
+                    tracing::debug!("Reusing cached IMAP session");
+                    return Ok(session);
+                }
+                Err(e) => {
+                    tracing::debug!("Cached session stale ({}), creating new", e);
+                }
+            }
+        }
+        self.connect().await
+    }
+
+    /// Return a session to the pool for reuse.
+    async fn return_session(&self, session: ImapSession) {
+        let mut guard = self.session.lock().await;
+        *guard = Some(session);
     }
 
     /// Connect and authenticate to Gmail IMAP.
@@ -85,7 +114,7 @@ impl async_imap::Authenticator for XOAuth2Auth {
 #[async_trait]
 impl EmailBackend for ImapBackend {
     async fn list_mailboxes(&self) -> Result<Vec<Mailbox>> {
-        let mut session = self.connect().await?;
+        let mut session = self.acquire_session().await?;
         let mailboxes_stream = session.list(Some(""), Some("*")).await?;
         let raw_mailboxes: Vec<_> = mailboxes_stream.collect().await;
 
@@ -102,7 +131,7 @@ impl EmailBackend for ImapBackend {
         }
 
         tracing::debug!("Listed {} mailboxes", mailboxes.len());
-        session.logout().await?;
+        self.return_session(session).await;
         Ok(mailboxes)
     }
 
@@ -112,7 +141,7 @@ impl EmailBackend for ImapBackend {
         since_uid: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Vec<Envelope>> {
-        let mut session = self.connect().await?;
+        let mut session = self.acquire_session().await?;
         let mailbox_info = session.select(mailbox).await?;
 
         let fetch_items = "(UID FLAGS ENVELOPE BODY.PEEK[TEXT]<0.200>)";
@@ -125,7 +154,7 @@ impl EmailBackend for ImapBackend {
                 let limit = limit.unwrap_or(50);
                 let total = mailbox_info.exists;
                 if total == 0 {
-                    session.logout().await?;
+                    self.return_session(session).await;
                     return Ok(vec![]);
                 }
                 let start = total.saturating_sub(limit - 1);
@@ -143,14 +172,14 @@ impl EmailBackend for ImapBackend {
         }
 
         tracing::debug!("Fetched {} envelopes from {}", envelopes.len(), mailbox);
-        session.logout().await?;
+        self.return_session(session).await;
         envelopes.sort_by(|a, b| b.date.cmp(&a.date));
         Ok(envelopes)
     }
 
     async fn fetch_email(&self, mailbox: &str, uid: u32) -> Result<Email> {
         tracing::debug!("Fetching full email uid={} from {}", uid, mailbox);
-        let mut session = self.connect().await?;
+        let mut session = self.acquire_session().await?;
         session.select(mailbox).await?;
 
         let messages_stream = session
@@ -230,7 +259,7 @@ impl EmailBackend for ImapBackend {
             body_text
         };
 
-        session.logout().await?;
+        self.return_session(session).await;
 
         Ok(Email {
             uid,
@@ -302,7 +331,7 @@ impl EmailBackend for ImapBackend {
 
     async fn delete_email(&self, mailbox: &str, uid: u32) -> Result<()> {
         tracing::debug!("Deleting email uid={} from {}", uid, mailbox);
-        let mut session = self.connect().await?;
+        let mut session = self.acquire_session().await?;
         session.select(mailbox).await?;
         let _: Vec<_> = session
             .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
@@ -310,18 +339,18 @@ impl EmailBackend for ImapBackend {
             .collect()
             .await;
         let _: Vec<_> = session.expunge().await?.collect().await;
-        session.logout().await?;
+        self.return_session(session).await;
         Ok(())
     }
 
     async fn archive_email(&self, mailbox: &str, uid: u32) -> Result<()> {
         tracing::debug!("Archiving email uid={} from {}", uid, mailbox);
-        let mut session = self.connect().await?;
+        let mut session = self.acquire_session().await?;
         session.select(mailbox).await?;
         session
             .uid_mv(uid.to_string(), "[Gmail]/All Mail")
             .await?;
-        session.logout().await?;
+        self.return_session(session).await;
         Ok(())
     }
 
@@ -333,7 +362,7 @@ impl EmailBackend for ImapBackend {
         value: bool,
     ) -> Result<()> {
         tracing::debug!("Setting flag {:?}={} on uid={} in {}", flag, value, uid, mailbox);
-        let mut session = self.connect().await?;
+        let mut session = self.acquire_session().await?;
         session.select(mailbox).await?;
 
         let flag_str = match flag {
@@ -349,13 +378,13 @@ impl EmailBackend for ImapBackend {
         };
 
         let _: Vec<_> = session.uid_store(uid.to_string(), &op).await?.collect().await;
-        session.logout().await?;
+        self.return_session(session).await;
         Ok(())
     }
 
     async fn search_emails(&self, mailbox: &str, query: &str) -> Result<Vec<Envelope>> {
         tracing::info!("IMAP SEARCH in {} for {:?}", mailbox, query);
-        let mut session = self.connect().await?;
+        let mut session = self.acquire_session().await?;
         session.select(mailbox).await?;
 
         let search_query = format!(
@@ -365,7 +394,7 @@ impl EmailBackend for ImapBackend {
         let uids: Vec<u32> = session.uid_search(&search_query).await?.into_iter().collect();
 
         if uids.is_empty() {
-            session.logout().await?;
+            self.return_session(session).await;
             return Ok(vec![]);
         }
 
@@ -386,7 +415,7 @@ impl EmailBackend for ImapBackend {
             }
         }
 
-        session.logout().await?;
+        self.return_session(session).await;
         envelopes.sort_by(|a, b| b.date.cmp(&a.date));
         tracing::debug!("IMAP SEARCH returned {} results", envelopes.len());
         Ok(envelopes)
